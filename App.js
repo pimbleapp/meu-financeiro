@@ -3366,7 +3366,9 @@ const CHAVE_ARMAZENAMENTO_TEMA = '@meu-financeiro:temaEscuro';
 const CHAVE_ARMAZENAMENTO_IDIOMA = '@meu-financeiro:idioma';
 
 export default function App() {
-  const [escuro, setEscuro] = useState(false);
+  // Começa no modo escuro por padrão. Se a pessoa já tiver escolhido um
+  // tema antes (ver useEffect abaixo), a preferência salva é que manda.
+  const [escuro, setEscuro] = useState(true);
   const [carregandoTema, setCarregandoTema] = useState(true);
   const [idioma, setIdioma] = useState('pt');
   const [carregandoIdioma, setCarregandoIdioma] = useState(true);
