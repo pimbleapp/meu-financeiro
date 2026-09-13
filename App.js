@@ -824,6 +824,84 @@ function ProvedorDeSincronizacao({ children }) {
   return <SincronizacaoContext.Provider value={valor}>{children}</SincronizacaoContext.Provider>;
 }
 
+// ---------- Sessão vencida: renovar e tentar de novo ----------
+// O relógio do aparelho e o do servidor nem sempre batem. Quando o
+// aparelho está atrasado, o app ainda acha que o login vale, mas o
+// servidor já considera vencido — e aí TODA leitura e gravação volta com
+// "JWT expired" (erro 401). Sem tratar isso, o app fica preso em "não
+// consegui enviar" pra sempre e ninguém entende o motivo.
+//
+// A regra aqui é: quem manda é o servidor, não o relógio daqui. Deu erro
+// de sessão vencida, renova o login e refaz a chamada uma vez.
+function ehSessaoVencida(erro) {
+  if (!erro) return false;
+  const codigo = erro.code || '';
+  const status = erro.status || erro.statusCode || 0;
+  const mensagem = String(erro.message || '').toLowerCase();
+  return (
+    codigo === 'PGRST303' ||
+    status === 401 ||
+    mensagem.includes('jwt expired') ||
+    mensagem.includes('token is expired') ||
+    mensagem.includes('invalid claim')
+  );
+}
+
+// Se o refresh_token também não vale mais, não adianta insistir: a sessão
+// morreu de verdade (a pessoa trocou a senha, saiu em outro aparelho, ou
+// ficou tempo demais fora). Aí é caso de voltar pra tela de entrar.
+function sessaoMorreuDeVez(erro) {
+  if (!erro) return false;
+  const status = erro.status || erro.statusCode || 0;
+  const mensagem = String(erro.message || '').toLowerCase();
+  return (
+    status === 400 ||
+    mensagem.includes('refresh token') ||
+    mensagem.includes('invalid grant') ||
+    mensagem.includes('already used')
+  );
+}
+
+// Guarda a renovação em andamento: se várias telas perceberem a sessão
+// vencida ao mesmo tempo, todas esperam a MESMA renovação em vez de
+// disparar uma cada (o que invalidaria o refresh_token das outras).
+let renovacaoEmAndamento = null;
+
+async function renovarSessao() {
+  if (!renovacaoEmAndamento) renovacaoEmAndamento = supabase.auth.refreshSession();
+  const promessa = renovacaoEmAndamento;
+  try {
+    const { data, error } = await promessa;
+    if (error) throw error;
+    if (!data || !data.session) throw new Error('A sessão não foi renovada.');
+    return data.session;
+  } catch (erro) {
+    // Sessão morta: desloga. O "onAuthStateChange" lá do App() percebe e
+    // mostra a tela de entrar sozinho.
+    if (sessaoMorreuDeVez(erro)) {
+      console.log('Sessão expirada de vez, pedindo login de novo:', erro);
+      supabase.auth.signOut();
+    }
+    // Se foi só falta de internet, o erro sobe e o app trata como
+    // "sem servidor" — a sessão continua salva e tenta de novo depois.
+    throw erro;
+  } finally {
+    if (renovacaoEmAndamento === promessa) renovacaoEmAndamento = null;
+  }
+}
+
+// Roda uma tarefa que fala com o Supabase, renovando o login e repetindo
+// uma vez se o servidor disser que a sessão venceu.
+async function comSessaoValida(tarefa) {
+  try {
+    return await tarefa();
+  } catch (erro) {
+    if (!ehSessaoVencida(erro)) throw erro;
+    await renovarSessao();
+    return await tarefa();
+  }
+}
+
 // ---------- O hook que as telas usam ----------
 // Substitui o par "useEffect que carrega" + "useEffect que salva" que as
 // telas tinham antes. De fora ele parece um useState comum: devolve os
@@ -904,7 +982,7 @@ function useDadosSincronizados(dominio, userId, valorInicial, buscarNoServidor, 
 
     const valorEnviado = dadosRef.current;
     try {
-      await enviarRef.current(valorEnviado);
+      await comSessaoValida(() => enviarRef.current(valorEnviado));
       // Se a pessoa mexeu em mais alguma coisa enquanto isso ia pro
       // servidor, continua pendente — o próximo envio cuida do resto.
       if (dadosRef.current === valorEnviado) {
@@ -927,7 +1005,7 @@ function useDadosSincronizados(dominio, userId, valorInicial, buscarNoServidor, 
   // funcionar também como "segunda tentativa" de uma busca que falhou.
   const conversarComServidor = React.useCallback(async () => {
     try {
-      const doServidor = await buscarRef.current();
+      const doServidor = await comSessaoValida(() => buscarRef.current());
       if (!montadoRef.current) return;
       const eraPrimeira = !primeiraBuscaOkRef.current;
       primeiraBuscaOkRef.current = true;
@@ -1765,7 +1843,7 @@ function TelaInicio() {
 
       <View style={styles.balanceCard}>
         <View style={styles.balanceIconWrapper}>
-          <Ionicons name="wallet" size={22} color={cores.textoSobrePrimario} />
+          <Ionicons name="wallet" size={22} color={cores.heroIcone} />
         </View>
         <Text style={styles.balanceLabel}>{t('inicio.saldoTotal')}</Text>
         <Text style={styles.balanceValue}>{formatarMoeda(saldoTotal)}</Text>
@@ -4580,6 +4658,15 @@ const TEMA_CLARO = {
   // Acento da marca — só como forma preenchida, nunca como texto.
   destaque: '#00C4B4',
 
+  // Card de Saldo Total ("hero"). No claro ele é o bloco marinho cheio,
+  // que é justamente o peso que a marca pede na ação principal.
+  heroFundo: '#0F172A',
+  heroBorda: '#0F172A',
+  heroValor: '#FFFFFF',
+  heroLegenda: 'rgba(255,255,255,0.75)',
+  heroIconeFundo: 'rgba(255,255,255,0.16)',
+  heroIcone: '#FFFFFF',
+
   verde: '#059669',
   verdeFundo: '#ECFDF5',
   verdeBorda: '#A7F3D0',
@@ -4630,6 +4717,16 @@ const TEMA_ESCURO = {
   textoSobrePrimario: '#0F172A',
 
   destaque: '#00C4B4',
+
+  // No escuro, pintar o card de Saldo inteiro de verde-água daria um
+  // bloco enorme da cor de acento — o oposto do que a marca pede. Aqui
+  // ele vira um card normal e quem carrega o acento é só o número.
+  heroFundo: '#1E293B',
+  heroBorda: '#334155',
+  heroValor: '#00C4B4',
+  heroLegenda: '#94A3B8',
+  heroIconeFundo: 'rgba(0,196,180,0.14)',
+  heroIcone: '#00C4B4',
 
   verde: '#34D399',
   verdeFundo: '#052E23',
@@ -5757,7 +5854,9 @@ function criarEstilos(cores) {
 
     // Card de Saldo Total (aba Início) — chapado, sem sombra
     balanceCard: {
-      backgroundColor: cores.primario,
+      backgroundColor: cores.heroFundo,
+      borderWidth: 1,
+      borderColor: cores.heroBorda,
       borderRadius: 20,
       padding: 24,
       marginBottom: 16,
@@ -5766,7 +5865,7 @@ function criarEstilos(cores) {
       width: 40,
       height: 40,
       borderRadius: 12,
-      backgroundColor: 'rgba(255,255,255,0.16)',
+      backgroundColor: cores.heroIconeFundo,
       alignItems: 'center',
       justifyContent: 'center',
       marginBottom: 16,
@@ -5774,15 +5873,14 @@ function criarEstilos(cores) {
     balanceLabel: {
       fontSize: 14,
       fontFamily: FONTES.corpo,
-      color: cores.textoSobrePrimario,
-      opacity: 0.85,
+      color: cores.heroLegenda,
       marginBottom: 8,
     },
     balanceValue: {
       fontSize: 32,
       fontFamily: FONTES.marcaBold,
       fontWeight: '700',
-      color: cores.textoSobrePrimario,
+      color: cores.heroValor,
     },
 
     // Cards de Entradas e Saídas (aba Início)
