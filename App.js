@@ -10,6 +10,7 @@
 import React, { useState, useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
+  AppState,
   View,
   Text,
   FlatList,
@@ -26,7 +27,48 @@ import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import { useFonts } from 'expo-font';
+// Importamos peso por peso (caminho completo) de propósito: importar o
+// pacote inteiro faria o bundle carregar TODOS os pesos das duas famílias
+// (uns 7 MB de .ttf no site) em vez dos 7 arquivos que a gente usa.
+import { Comfortaa_700Bold } from '@expo-google-fonts/comfortaa/700Bold';
+import { Inter_400Regular } from '@expo-google-fonts/inter/400Regular';
+import { Inter_600SemiBold } from '@expo-google-fonts/inter/600SemiBold';
+import { Inter_700Bold } from '@expo-google-fonts/inter/700Bold';
 import { supabase } from './lib/supabase';
+
+// ============================================================
+// TIPOGRAFIA DA MARCA (pimble)
+// ============================================================
+// Comfortaa (arredondada, geométrica) é a "voz" da marca: títulos de tela,
+// títulos de seção e os valores em dinheiro grandes. Inter é a fonte de
+// leitura: textos, rótulos, linhas de lista, botões e números de tabela.
+//
+// Detalhe importante do React Native: com arquivos de fonte estáticos o
+// "fontWeight" NÃO escolhe o peso — cada peso é uma família diferente. Por
+// isso cada papel aqui embaixo aponta pro arquivo certo, e nos estilos a
+// gente usa "fontFamily" combinando com o "fontWeight" que já existia.
+// Só os pesos que a tela realmente usa entram aqui (e só eles são
+// baixados): os estilos deste arquivo têm fontWeight 700, 600 ou nenhum,
+// e a Comfortaa aparece sempre em 700. Se algum dia um estilo novo pedir
+// outro peso (ex: Inter_500Medium), adicione o import, a linha aqui e a
+// linha no FONTES_PARA_CARREGAR — senão ele cai na fonte do sistema.
+const FONTES = {
+  // Comfortaa — marca: títulos de tela, títulos de seção, valores grandes
+  marcaBold: 'Comfortaa_700Bold',
+  // Inter — interface: textos, rótulos, listas, botões, números de tabela
+  corpo: 'Inter_400Regular',
+  corpoSemi: 'Inter_600SemiBold',
+  corpoBold: 'Inter_700Bold',
+};
+
+// Mapa passado pro useFonts() lá no App().
+const FONTES_PARA_CARREGAR = {
+  Comfortaa_700Bold,
+  Inter_400Regular,
+  Inter_600SemiBold,
+  Inter_700Bold,
+};
 
 // ============================================================
 // AVISOS E CONFIRMAÇÕES (funcionam no celular E no site)
@@ -323,6 +365,7 @@ function dataParaBR(data) {
 // (um <input type="date">). O "onChange" continua com a mesma cara nos dois
 // casos — (evento, dataEscolhida) — pra não precisar mudar nada de quem usa.
 function SeletorDeData({ value, onChange }) {
+  const { cores } = useTema();
   if (Platform.OS === 'web') {
     return React.createElement('input', {
       type: 'date',
@@ -334,12 +377,14 @@ function SeletorDeData({ value, onChange }) {
       },
       style: {
         fontSize: 14,
-        padding: 10,
-        borderRadius: 8,
-        border: '1px solid #ccc',
-        marginTop: -6,
-        marginBottom: 12,
-        fontFamily: 'inherit',
+        padding: 12,
+        borderRadius: 12,
+        border: `1px solid ${cores.borda}`,
+        backgroundColor: cores.fundoSutil,
+        color: cores.texto,
+        marginTop: -8,
+        marginBottom: 16,
+        fontFamily: FONTES.corpo,
       },
     });
   }
@@ -579,6 +624,16 @@ function linhaParaMeta(linha) {
 }
 
 // ---------- Sequência ("streak") — uma linha só por usuário ----------
+// Ponto de partida de quem nunca usou o app (ou de quem ainda não tem linha
+// no banco). Fica fora do componente pra ser sempre o MESMO objeto — é o
+// que o cache e o useDadosSincronizados comparam.
+const STREAK_ZERADA = {
+  streakAtual: 0,
+  melhorStreak: 0,
+  diaRegistrado: null,
+  statusMaisRecente: null,
+};
+
 async function buscarStreakDoUsuario(userId) {
   const { data, error } = await supabase
     .from(TABELA_STREAK)
@@ -606,6 +661,374 @@ async function salvarStreakDoUsuario(userId, streakData) {
     { onConflict: 'user_id' }
   );
   if (error) throw error;
+}
+
+// ============================================================
+// CACHE LOCAL + SINCRONIZAÇÃO (é isso que faz o app abrir sem internet)
+// ============================================================
+// Por que isso existe: quando os dados passaram a morar no Supabase, o app
+// virou refém da conexão — sem internet as telas abriam vazias, e um
+// lançamento recém-digitado podia simplesmente não chegar ao servidor sem
+// ninguém perceber. Num app de dinheiro isso não pode acontecer.
+//
+// A ideia, em uma frase: o aparelho tem sempre uma cópia local (o "cache")
+// e o servidor é a cópia "oficial"; a tela lê a cópia local na hora e o
+// servidor vai acertando as coisas em segundo plano.
+//
+// Três regras, nessa ordem de importância:
+//
+//   1) TRAVA DE ORDEM — nada é enviado pro servidor antes da PRIMEIRA busca
+//      daquele domínio dar certo. Sem essa trava, um cache velho (de uma
+//      sessão antiga neste mesmo aparelho) subiria por cima de dados mais
+//      novos que estão no servidor, no segundo em que o app abrisse. Até a
+//      primeira busca dar certo, tudo que a pessoa mexer é gravado SÓ no
+//      cache.
+//
+//   2) QUEM GANHA — quando a primeira busca dá certo, a gente compara
+//      "intenções", não datas: se o cache está marcado como "pendente"
+//      (tem alteração que nunca chegou ao servidor), o local ganha e é
+//      enviado pra cima; se não está pendente, o cache é só um espelho do
+//      servidor, então o servidor ganha e o cache é reescrito.
+//
+//   3) ÚLTIMA GRAVAÇÃO VENCE — não existe merge de verdade. Se a mesma
+//      pessoa mexer nas mesmas contas em dois aparelhos ao mesmo tempo, o
+//      último que conseguir enviar sobrescreve o outro. Pra uma pessoa só
+//      com um ou dois aparelhos isso é aceitável e é MUITO mais simples de
+//      entender do que qualquer merge automático — mas fica registrado
+//      aqui pra quem for mexer nisso depois não se assustar.
+
+// Cada usuário tem o seu próprio espaço de cache, pra duas contas no mesmo
+// aparelho nunca misturarem dados. Ex:
+// "@meu-financeiro:cache:8f3c...:transacoes"
+const PREFIXO_CACHE = '@meu-financeiro:cache';
+
+function chaveDoCache(userId, dominio) {
+  return `${PREFIXO_CACHE}:${userId}:${dominio}`;
+}
+
+// O cache é guardado dentro de um "envelope" em vez de solto, porque além
+// dos dados a gente precisa lembrar de UMA coisa: se essas alterações já
+// chegaram ao servidor ou não ("pendente"). Esse marcador precisa
+// sobreviver a fechar e reabrir o app — senão uma alteração que não subiu
+// ontem seria tratada como simples espelho do servidor hoje, e sumiria.
+const VERSAO_CACHE = 1;
+
+async function lerCacheLocal(userId, dominio) {
+  try {
+    const bruto = await AsyncStorage.getItem(chaveDoCache(userId, dominio));
+    if (bruto === null) return null;
+    const conteudo = JSON.parse(bruto);
+    // Envelope novo (o formato normal)
+    if (conteudo && typeof conteudo === 'object' && !Array.isArray(conteudo) && conteudo.versao === VERSAO_CACHE) {
+      return { dados: conteudo.dados, pendente: Boolean(conteudo.pendente) };
+    }
+    // Qualquer outra coisa que estiver gravada aí (um formato antigo, por
+    // exemplo) entra como espelho do servidor: dá pra mostrar na tela, mas
+    // não tem permissão pra subir por cima de nada.
+    return { dados: conteudo, pendente: false };
+  } catch (erro) {
+    console.log(`Não foi possível ler o cache local de "${dominio}":`, erro);
+    return null;
+  }
+}
+
+async function gravarCacheLocal(userId, dominio, dados, pendente) {
+  try {
+    await AsyncStorage.setItem(
+      chaveDoCache(userId, dominio),
+      JSON.stringify({ versao: VERSAO_CACHE, pendente: Boolean(pendente), dados })
+    );
+  } catch (erro) {
+    console.log(`Não foi possível gravar o cache local de "${dominio}":`, erro);
+  }
+}
+
+// ---------- O "painel" de sincronização ----------
+// Guarda, por domínio, duas coisinhas: se tem alteração local que ainda não
+// subiu ("pendente") e se a última conversa com o servidor falhou
+// ("semServidor"). É daqui que a faixa de aviso (BannerDeSincronizacao) tira
+// o que mostrar — e é daqui que sai o "tenta de novo" quando o app volta pro
+// primeiro plano ou a internet volta.
+const SincronizacaoContext = React.createContext({
+  estados: {},
+  marcarEstado: () => {},
+  registrarReenvio: () => () => {},
+  reenviarPendencias: () => {},
+});
+
+function useSincronizacao() {
+  return React.useContext(SincronizacaoContext);
+}
+
+function ProvedorDeSincronizacao({ children }) {
+  const [estados, setEstados] = useState({});
+  // Cada domínio montado deixa aqui a função "tenta enviar de novo".
+  // É um objeto simples de propósito: não é uma fila de tarefas, é só
+  // "quem está na tela agora sabe se reenviar sozinho".
+  const reenviosRef = React.useRef({});
+
+  const marcarEstado = React.useCallback((dominio, mudanca) => {
+    setEstados((atual) => {
+      const anterior = atual[dominio] || { pendente: false, semServidor: false };
+      const novo = { ...anterior, ...mudanca };
+      if (anterior.pendente === novo.pendente && anterior.semServidor === novo.semServidor) return atual;
+      return { ...atual, [dominio]: novo };
+    });
+  }, []);
+
+  const registrarReenvio = React.useCallback((dominio, funcao) => {
+    reenviosRef.current[dominio] = funcao;
+    return () => {
+      if (reenviosRef.current[dominio] === funcao) delete reenviosRef.current[dominio];
+    };
+  }, []);
+
+  const reenviarPendencias = React.useCallback(() => {
+    Object.keys(reenviosRef.current).forEach((dominio) => {
+      const tentarDeNovo = reenviosRef.current[dominio];
+      if (tentarDeNovo) tentarDeNovo();
+    });
+  }, []);
+
+  // Segunda chance automática: quando o app volta pro primeiro plano (no
+  // celular) ou a aba volta a ficar visível / a internet volta (no site),
+  // a gente tenta enviar de novo o que ficou pendente. Sem fila, sem
+  // repetição em loop — só um empurrãozinho nos momentos em que faz
+  // sentido. (A outra chance está no próprio useDadosSincronizados: toda
+  // busca bem-sucedida no servidor já tenta reenviar o que estava parado.)
+  useEffect(() => {
+    const assinatura = AppState.addEventListener('change', (estadoDoApp) => {
+      if (estadoDoApp === 'active') reenviarPendencias();
+    });
+
+    let limparWeb = null;
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      const aoVoltarPraTela = () => {
+        if (typeof document === 'undefined' || document.visibilityState === 'visible') reenviarPendencias();
+      };
+      window.addEventListener('online', aoVoltarPraTela);
+      if (typeof document !== 'undefined') document.addEventListener('visibilitychange', aoVoltarPraTela);
+      limparWeb = () => {
+        window.removeEventListener('online', aoVoltarPraTela);
+        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', aoVoltarPraTela);
+      };
+    }
+
+    return () => {
+      if (assinatura && assinatura.remove) assinatura.remove();
+      if (limparWeb) limparWeb();
+    };
+  }, [reenviarPendencias]);
+
+  const valor = { estados, marcarEstado, registrarReenvio, reenviarPendencias };
+  return <SincronizacaoContext.Provider value={valor}>{children}</SincronizacaoContext.Provider>;
+}
+
+// ---------- O hook que as telas usam ----------
+// Substitui o par "useEffect que carrega" + "useEffect que salva" que as
+// telas tinham antes. De fora ele parece um useState comum: devolve os
+// dados, o setter e um "carregando".
+//
+// Parâmetros:
+//   dominio            — nome curto e estável ("transacoes", "dividas"...),
+//                        usado como chave do cache e do painel de sync
+//   userId             — dono dos dados (entra na chave do cache)
+//   valorInicial       — o que mostrar enquanto nada chegou
+//   buscarNoServidor   — async () => dados       (já em camelCase)
+//   enviarProServidor  — async (dados) => void   — passe null quando a tela
+//                        só LÊ esse domínio (ex: a aba Investimentos lê as
+//                        contas fixas só pra calcular a reserva de
+//                        emergência). Domínio só-leitura nunca grava o
+//                        cache, justamente pra não apagar sem querer uma
+//                        alteração pendente que outra aba deixou lá.
+function useDadosSincronizados(dominio, userId, valorInicial, buscarNoServidor, enviarProServidor) {
+  const { marcarEstado, registrarReenvio } = useSincronizacao();
+
+  const [dados, setDados] = useState(valorInicial);
+  // "carregando" fica falso assim que o CACHE aparece (é o que faz a tela
+  // abrir na hora). "buscaTerminou" é outra coisa: só fica verdadeiro
+  // depois que a tentativa no servidor acabou, tendo dado certo ou não.
+  const [carregando, setCarregando] = useState(true);
+  const [buscaTerminou, setBuscaTerminou] = useState(false);
+
+  const somenteLeitura = !enviarProServidor;
+
+  // As duas funções mudam a cada render (são closures da tela), então ficam
+  // em refs — assim os efeitos abaixo dependem só de "dominio" e "userId" e
+  // não ficam recarregando tudo a cada tecla digitada.
+  const buscarRef = React.useRef(buscarNoServidor);
+  const enviarRef = React.useRef(enviarProServidor);
+  buscarRef.current = buscarNoServidor;
+  enviarRef.current = enviarProServidor;
+
+  const dadosRef = React.useRef(dados);
+  dadosRef.current = dados;
+
+  // Evita mexer no estado de uma tela que já saiu do ar (trocou de aba,
+  // fez logout) — as funções abaixo são assíncronas e podem voltar tarde.
+  const montadoRef = React.useRef(true);
+  useEffect(() => {
+    montadoRef.current = true;
+    return () => {
+      montadoRef.current = false;
+    };
+  }, []);
+
+  // A TRAVA DE ORDEM da regra 1 lá de cima, em forma de variável: só vira
+  // true quando uma busca no servidor deu certo pra ESTE domínio.
+  const primeiraBuscaOkRef = React.useRef(false);
+  // true = tem alteração local que ainda não chegou ao servidor
+  const pendenteRef = React.useRef(false);
+  // Serve pro efeito de "salvar quando muda" distinguir uma alteração feita
+  // PELA PESSOA de uma troca de estado que veio do próprio carregamento
+  // (cache ou servidor) — essa segunda não é novidade nenhuma pro servidor.
+  // Começa valendo o próprio valor inicial: sem isso, um domínio que não
+  // tem cache nenhum E não conseguiu falar com o servidor (primeira vez
+  // usando o app, sem internet) seria marcado como "alterado" só por
+  // continuar com a lista vazia do começo — e a faixa de aviso apareceria
+  // sem a pessoa ter mexido em nada.
+  const valorVindoDeForaRef = React.useRef(undefined);
+  if (valorVindoDeForaRef.current === undefined) valorVindoDeForaRef.current = dados;
+
+  // Envia pro servidor o que está na tela agora.
+  const enviarAgora = React.useCallback(async () => {
+    if (!enviarRef.current) return; // domínio só-leitura
+    if (!pendenteRef.current) return; // não tem nada novo pra mandar
+    if (!primeiraBuscaOkRef.current) {
+      // TRAVA DE ORDEM: ainda não sabemos o que tem no servidor, então não
+      // temos o direito de escrever lá. Fica guardado no cache e a faixa de
+      // aviso conta isso pra pessoa.
+      marcarEstado(dominio, { pendente: true });
+      return;
+    }
+
+    const valorEnviado = dadosRef.current;
+    try {
+      await enviarRef.current(valorEnviado);
+      // Se a pessoa mexeu em mais alguma coisa enquanto isso ia pro
+      // servidor, continua pendente — o próximo envio cuida do resto.
+      if (dadosRef.current === valorEnviado) {
+        pendenteRef.current = false;
+        await gravarCacheLocal(userId, dominio, valorEnviado, false);
+        marcarEstado(dominio, { pendente: false, semServidor: false });
+      } else {
+        marcarEstado(dominio, { semServidor: false });
+      }
+    } catch (erro) {
+      pendenteRef.current = true;
+      marcarEstado(dominio, { pendente: true, semServidor: true });
+      console.log(`Não foi possível enviar "${dominio}" pro servidor:`, erro);
+    }
+  }, [dominio, userId, marcarEstado]);
+
+  // Conversa completa com o servidor: busca o que tem lá e decide quem
+  // ganha (regra 2). É chamada no carregamento da tela e de novo quando o
+  // app volta pro primeiro plano / a internet volta — por isso ela precisa
+  // funcionar também como "segunda tentativa" de uma busca que falhou.
+  const conversarComServidor = React.useCallback(async () => {
+    try {
+      const doServidor = await buscarRef.current();
+      if (!montadoRef.current) return;
+      const eraPrimeira = !primeiraBuscaOkRef.current;
+      primeiraBuscaOkRef.current = true;
+      marcarEstado(dominio, { semServidor: false });
+
+      if (pendenteRef.current) {
+        // O cache tem alteração que nunca subiu: o local ganha e é ele que
+        // vai pro servidor (última gravação vence). Repare que mesmo aqui a
+        // subida só acontece DEPOIS da busca ter dado certo.
+        await enviarAgora();
+      } else if (eraPrimeira) {
+        // Primeira busca e nada pendente: o cache era só um espelho, então
+        // o servidor manda e o espelho é reescrito com o que veio de lá.
+        valorVindoDeForaRef.current = doServidor;
+        setDados(doServidor);
+        if (!somenteLeitura) await gravarCacheLocal(userId, dominio, doServidor, false);
+      }
+      // (numa retentativa sem nada pendente não há o que fazer: o que está
+      // na tela já é o que está no servidor)
+    } catch (erro) {
+      if (!montadoRef.current) return;
+      // Sem servidor: segue com o que veio do cache, sem apagar nada.
+      marcarEstado(dominio, { semServidor: true });
+      console.log(`Não foi possível falar com o servidor sobre "${dominio}":`, erro);
+    }
+  }, [dominio, userId, somenteLeitura, marcarEstado, enviarAgora]);
+
+  // Deixa a função de "tenta de novo" no painel, pra ela ser chamada quando
+  // o app voltar pro primeiro plano ou a internet voltar. Ela cobre os dois
+  // casos: a busca que nunca deu certo e o envio que falhou.
+  //
+  // Quando a tela sai do ar (a pessoa trocou de aba), o domínio para de
+  // tentar — e aí a gente apaga o "não consegui falar com o servidor" dele,
+  // senão essa notícia velha deixaria a faixa de aviso na tela mesmo depois
+  // da internet voltar. O "tem alteração pendente" NÃO é apagado: esse é um
+  // fato sobre os dados, não sobre a tela, e continua valendo até a
+  // alteração realmente subir (o que acontece quando a pessoa voltar
+  // naquela aba, ou na próxima vez que abrir o app).
+  useEffect(() => {
+    const desregistrar = registrarReenvio(dominio, conversarComServidor);
+    return () => {
+      desregistrar();
+      marcarEstado(dominio, { semServidor: false });
+    };
+  }, [dominio, conversarComServidor, registrarReenvio, marcarEstado]);
+
+  // ---- Carregamento: cache primeiro, servidor depois ----
+  useEffect(() => {
+    let ativo = true;
+    primeiraBuscaOkRef.current = false;
+    pendenteRef.current = false;
+    // Se o dono dos dados mudou (a pessoa saiu e entrou com outra conta), o
+    // que está na tela ainda é da conta anterior. Marcar isso como "veio de
+    // fora" impede que esses dados sejam gravados no cache — e enviados —
+    // como se fossem da conta nova.
+    valorVindoDeForaRef.current = dadosRef.current;
+    setCarregando(true);
+    setBuscaTerminou(false);
+
+    async function carregar() {
+      // 1) O que já está no aparelho aparece na hora (inclusive sem
+      //    internet nenhuma).
+      const cache = await lerCacheLocal(userId, dominio);
+      if (!ativo) return;
+      if (cache) {
+        pendenteRef.current = Boolean(cache.pendente) && !somenteLeitura;
+        if (pendenteRef.current) marcarEstado(dominio, { pendente: true });
+        valorVindoDeForaRef.current = cache.dados;
+        setDados(cache.dados);
+        setCarregando(false);
+      }
+
+      // 2) Agora sim, o servidor.
+      await conversarComServidor();
+      if (!ativo) return;
+      setCarregando(false);
+      setBuscaTerminou(true);
+    }
+
+    carregar();
+    return () => {
+      ativo = false;
+    };
+  }, [userId, dominio, somenteLeitura, marcarEstado, conversarComServidor]);
+
+  // ---- Gravação: cache sempre, servidor quando der ----
+  useEffect(() => {
+    if (carregando) return;
+    if (somenteLeitura) return;
+    // Mudou porque acabou de carregar, não porque a pessoa mexeu.
+    if (dados === valorVindoDeForaRef.current) return;
+
+    pendenteRef.current = true;
+    // Repare que a faixa de aviso NÃO é ligada aqui: o normal é o envio dar
+    // certo logo em seguida, e piscar um aviso a cada tecla seria pior que
+    // não avisar nada. Quem liga o aviso é o enviarAgora(), se falhar ou se
+    // estiver travado esperando a primeira busca.
+    gravarCacheLocal(userId, dominio, dados, true).then(enviarAgora);
+  }, [dados, carregando, somenteLeitura, userId, dominio, enviarAgora]);
+
+  return { dados, setDados, carregando, buscaTerminou };
 }
 
 // Volta um dia a partir de uma data "AAAA-MM-DD" (cuida sozinho da virada
@@ -717,8 +1140,22 @@ function TelaInicio() {
   const { t } = useIdioma();
   const { user } = useAuth();
   const userId = user.id;
-  const [transacoes, setTransacoes] = useState([]);
-  const [carregandoTransacoes, setCarregandoTransacoes] = useState(true);
+
+  // As transações vêm do useDadosSincronizados: cache do aparelho primeiro
+  // (abre na hora, funciona sem internet) e Supabase logo em seguida. De
+  // fora é igualzinho a um useState.
+  const {
+    dados: transacoes,
+    setDados: setTransacoes,
+    carregando: carregandoTransacoes,
+  } = useDadosSincronizados(
+    TABELA_TRANSACOES,
+    userId,
+    [],
+    () => buscarLinhasDoUsuario(TABELA_TRANSACOES, userId, linhaParaTransacao).then((lista) => lista.map(comDataISO)),
+    (lista) => sincronizarLinhasDoUsuario(TABELA_TRANSACOES, userId, lista, transacaoParaLinha)
+  );
+
   const [modalVisivel, setModalVisivel] = useState(false);
 
   // Campos do formulário de nova transação
@@ -743,17 +1180,32 @@ function TelaInicio() {
   // e "statusMaisRecente" guarda o status mais atual desse dia (vai sendo
   // atualizado se você abrir o app de novo no mesmo dia); só quando o dia
   // vira de verdade é que esse status conta (ou não) pra sequência.
-  const [streakData, setStreakData] = useState({
-    streakAtual: 0,
-    melhorStreak: 0,
-    diaRegistrado: null,
-    statusMaisRecente: null,
-  });
-  const [carregandoStreak, setCarregandoStreak] = useState(true);
+  const {
+    dados: streakData,
+    setDados: setStreakData,
+    carregando: carregandoStreak,
+    buscaTerminou: streakBuscaTerminou,
+  } = useDadosSincronizados(
+    TABELA_STREAK,
+    userId,
+    STREAK_ZERADA,
+    () => buscarStreakDoUsuario(userId).then((salva) => salva || STREAK_ZERADA),
+    (valor) => salvarStreakDoUsuario(userId, valor)
+  );
 
   // Contas fixas (salário, aluguel...) que se repetem todo mês
-  const [contasFixas, setContasFixas] = useState([]);
-  const [carregandoContasFixas, setCarregandoContasFixas] = useState(true);
+  const {
+    dados: contasFixas,
+    setDados: setContasFixas,
+    carregando: carregandoContasFixas,
+  } = useDadosSincronizados(
+    TABELA_CONTAS_FIXAS,
+    userId,
+    [],
+    () => buscarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, linhaParaContaFixa),
+    (lista) => sincronizarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, lista, contaFixaParaLinha)
+  );
+
   const [modalContaFixaVisivel, setModalContaFixaVisivel] = useState(false);
   const [novoTituloFixa, setNovoTituloFixa] = useState('');
   const [novoValorFixa, setNovoValorFixa] = useState('');
@@ -767,97 +1219,17 @@ function TelaInicio() {
   // Dívidas cadastradas na aba Dívidas — carregadas aqui também só pra
   // mostrar a parcela de cada uma e deixar confirmar o pagamento do mês
   // direto por aqui (edição completa continua lá na aba Dívidas).
-  const [dividas, setDividas] = useState([]);
-  const [carregandoDividas, setCarregandoDividas] = useState(true);
-
-  // Carrega as transações salvas (no Supabase, só as desse usuário) assim
-  // que a tela abre
-  useEffect(() => {
-    async function carregarTransacoesSalvas() {
-      try {
-        const transacoesCarregadas = await buscarLinhasDoUsuario(TABELA_TRANSACOES, userId, linhaParaTransacao);
-        setTransacoes(transacoesCarregadas.map(comDataISO));
-      } catch (erro) {
-        console.log('Não foi possível carregar as transações salvas:', erro);
-      } finally {
-        setCarregandoTransacoes(false);
-      }
-    }
-    carregarTransacoesSalvas();
-  }, [userId]);
-
-  // Salva de novo toda vez que a lista de transações mudar
-  useEffect(() => {
-    if (carregandoTransacoes) return;
-    sincronizarLinhasDoUsuario(TABELA_TRANSACOES, userId, transacoes, transacaoParaLinha).catch((erro) => {
-      console.log('Não foi possível salvar as transações:', erro);
-    });
-  }, [transacoes, carregandoTransacoes, userId]);
-
-  // Carrega as contas fixas salvas
-  useEffect(() => {
-    async function carregarContasFixasSalvas() {
-      try {
-        const contasCarregadas = await buscarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, linhaParaContaFixa);
-        setContasFixas(contasCarregadas);
-      } catch (erro) {
-        console.log('Não foi possível carregar as contas fixas salvas:', erro);
-      } finally {
-        setCarregandoContasFixas(false);
-      }
-    }
-    carregarContasFixasSalvas();
-  }, [userId]);
-
-  // Salva de novo toda vez que a lista de contas fixas mudar
-  useEffect(() => {
-    if (carregandoContasFixas) return;
-    sincronizarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, contasFixas, contaFixaParaLinha).catch((erro) => {
-      console.log('Não foi possível salvar as contas fixas:', erro);
-    });
-  }, [contasFixas, carregandoContasFixas, userId]);
-
-  // Carrega as dívidas salvas (a mesma tabela que a aba Dívidas usa)
-  useEffect(() => {
-    async function carregarDividasSalvas() {
-      try {
-        const dividasCarregadas = await buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida);
-        setDividas(dividasCarregadas);
-      } catch (erro) {
-        console.log('Não foi possível carregar as dívidas salvas:', erro);
-      } finally {
-        setCarregandoDividas(false);
-      }
-    }
-    carregarDividasSalvas();
-  }, [userId]);
-
-  // Salva de novo toda vez que a lista de dívidas mudar (por causa da
-  // confirmação de parcela, feita aqui na tela de Início)
-  useEffect(() => {
-    if (carregandoDividas) return;
-    sincronizarLinhasDoUsuario(TABELA_DIVIDAS, userId, dividas, dividaParaLinha).catch((erro) => {
-      console.log('Não foi possível salvar as dívidas:', erro);
-    });
-  }, [dividas, carregandoDividas, userId]);
-
-  // Carrega a sequência salva (a lógica que atualiza ela mesma fica lá
-  // embaixo, depois que o status do semáforo de hoje já foi calculado)
-  useEffect(() => {
-    async function carregarStreakSalva() {
-      try {
-        const streakCarregada = await buscarStreakDoUsuario(userId);
-        if (streakCarregada !== null) {
-          setStreakData(streakCarregada);
-        }
-      } catch (erro) {
-        console.log('Não foi possível carregar a sequência salva:', erro);
-      } finally {
-        setCarregandoStreak(false);
-      }
-    }
-    carregarStreakSalva();
-  }, [userId]);
+  const {
+    dados: dividas,
+    setDados: setDividas,
+    carregando: carregandoDividas,
+  } = useDadosSincronizados(
+    TABELA_DIVIDAS,
+    userId,
+    [],
+    () => buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida),
+    (lista) => sincronizarLinhasDoUsuario(TABELA_DIVIDAS, userId, lista, dividaParaLinha)
+  );
 
   // Os totais são calculados de verdade, a partir de TODAS as transações
   // (o Saldo Total é o acumulado geral, não só do mês)
@@ -962,8 +1334,14 @@ function TelaInicio() {
   // Quando o dia vira, aí sim fecha o dia anterior: se ele não tinha virado
   // vermelho E é literalmente "ontem" (sem pular dias), soma 1 na sequência;
   // senão, zera.
+  //
+  // Repare que aqui a espera é pelo "streakBuscaTerminou", e não pelo
+  // "carregandoStreak": o carregando some assim que o cache aparece, mas a
+  // sequência só pode ser recalculada depois que a tentativa no servidor
+  // acabou (deu certo ou não). Senão a gente contaria o dia por cima de uma
+  // sequência velha e mandaria esse número errado pro servidor.
   useEffect(() => {
-    if (carregandoStreak) return;
+    if (!streakBuscaTerminou) return;
     setStreakData((atual) => {
       if (atual.diaRegistrado === hojeISO) {
         if (atual.statusMaisRecente === statusGastoDiario) return atual;
@@ -984,15 +1362,10 @@ function TelaInicio() {
         statusMaisRecente: statusGastoDiario,
       };
     });
-  }, [hojeISO, statusGastoDiario, carregandoStreak]);
+  }, [hojeISO, statusGastoDiario, streakBuscaTerminou, setStreakData]);
 
-  // Salva a sequência sempre que ela mudar
-  useEffect(() => {
-    if (carregandoStreak) return;
-    salvarStreakDoUsuario(userId, streakData).catch((erro) => {
-      console.log('Não foi possível salvar a sequência:', erro);
-    });
-  }, [streakData, carregandoStreak, userId]);
+  // (não existe mais um efeito só pra salvar a sequência: quem grava o
+  // cache e envia pro Supabase é o próprio useDadosSincronizados lá em cima)
 
   // ---- "Alerta de mês estranho" ----
   const alertaMesEstranho = calcularAlertaMesEstranho(transacoesJaOcorridas, mesAtualChave, diaDeHoje);
@@ -1392,7 +1765,7 @@ function TelaInicio() {
 
       <View style={styles.balanceCard}>
         <View style={styles.balanceIconWrapper}>
-          <Ionicons name="wallet" size={22} color={cores.branco} />
+          <Ionicons name="wallet" size={22} color={cores.textoSobrePrimario} />
         </View>
         <Text style={styles.balanceLabel}>{t('inicio.saldoTotal')}</Text>
         <Text style={styles.balanceValue}>{formatarMoeda(saldoTotal)}</Text>
@@ -1670,7 +2043,7 @@ function TelaInicio() {
                 <Ionicons
                   name={confirmadaEsseMes ? 'checkmark-circle' : 'time-outline'}
                   size={16}
-                  color={confirmadaEsseMes ? cores.verdeTextoForte : cores.branco}
+                  color={confirmadaEsseMes ? cores.verdeTextoForte : cores.textoSobrePrimario}
                 />
                 <Text
                   style={[
@@ -1741,7 +2114,7 @@ function TelaInicio() {
                 <Ionicons
                   name={confirmadaEsseMes ? 'checkmark-circle' : 'time-outline'}
                   size={16}
-                  color={confirmadaEsseMes ? cores.verdeTextoForte : cores.branco}
+                  color={confirmadaEsseMes ? cores.verdeTextoForte : cores.textoSobrePrimario}
                 />
                 <Text
                   style={[
@@ -1946,7 +2319,7 @@ function TelaInicio() {
 
             <Text style={styles.inputLabel}>{t('inicio.data')}</Text>
             <TouchableOpacity style={styles.input} onPress={() => setMostrarSeletorData(true)}>
-              <Text style={{ fontSize: 14, color: cores.texto }}>{dataParaBR(dataSelecionada)}</Text>
+              <Text style={{ fontSize: 14, fontFamily: FONTES.corpo, color: cores.texto }}>{dataParaBR(dataSelecionada)}</Text>
             </TouchableOpacity>
             {mostrarSeletorData && <SeletorDeData value={dataSelecionada} onChange={aoMudarData} />}
 
@@ -2335,8 +2708,18 @@ function TelaInvestimentos() {
   const { t } = useIdioma();
   const { user } = useAuth();
   const userId = user.id;
-  const [investimentos, setInvestimentos] = useState([]);
-  const [carregandoInvestimentos, setCarregandoInvestimentos] = useState(true);
+  const {
+    dados: investimentos,
+    setDados: setInvestimentos,
+    carregando: carregandoInvestimentos,
+  } = useDadosSincronizados(
+    TABELA_INVESTIMENTOS,
+    userId,
+    [],
+    () => buscarLinhasDoUsuario(TABELA_INVESTIMENTOS, userId, linhaParaInvestimento),
+    (lista) => sincronizarLinhasDoUsuario(TABELA_INVESTIMENTOS, userId, lista, investimentoParaLinha)
+  );
+
   const [modalVisivel, setModalVisivel] = useState(false);
   const [investimentoEditandoId, setInvestimentoEditandoId] = useState(null);
 
@@ -2348,10 +2731,25 @@ function TelaInvestimentos() {
 
   // Dados de outras abas, só pra LER (não são salvos daqui): as contas
   // fixas dão a meta de reserva de emergência, e as dívidas alimentam o
-  // comparador "investir ou quitar?" logo abaixo.
-  const [contasFixas, setContasFixas] = useState([]);
-  const [dividas, setDividas] = useState([]);
-  const [carregandoDadosExternos, setCarregandoDadosExternos] = useState(true);
+  // comparador "investir ou quitar?" logo abaixo. Por serem só-leitura
+  // (último parâmetro null), eles leem o cache mas nunca gravam nele — o
+  // dono desses dois domínios é a aba Início / a aba Dívidas, e seria ruim
+  // esta aba apagar por cima uma alteração que ainda não subiu de lá.
+  const { dados: contasFixas, carregando: carregandoContasFixasExternas } = useDadosSincronizados(
+    TABELA_CONTAS_FIXAS,
+    userId,
+    [],
+    () => buscarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, linhaParaContaFixa),
+    null
+  );
+  const { dados: dividas, carregando: carregandoDividasExternas } = useDadosSincronizados(
+    TABELA_DIVIDAS,
+    userId,
+    [],
+    () => buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida),
+    null
+  );
+  const carregandoDadosExternos = carregandoContasFixasExternas || carregandoDividasExternas;
 
   const [dividaComparadaId, setDividaComparadaId] = useState(null);
   const [taxaInvestimentoTexto, setTaxaInvestimentoTexto] = useState('10');
@@ -2361,8 +2759,18 @@ function TelaInvestimentos() {
   const [taxaSimulacaoTexto, setTaxaSimulacaoTexto] = useState('10');
 
   // Metas de economia (ex: "juntar R$3000 pra uma viagem")
-  const [metas, setMetas] = useState([]);
-  const [carregandoMetas, setCarregandoMetas] = useState(true);
+  const {
+    dados: metas,
+    setDados: setMetas,
+    carregando: carregandoMetas,
+  } = useDadosSincronizados(
+    TABELA_METAS,
+    userId,
+    [],
+    () => buscarLinhasDoUsuario(TABELA_METAS, userId, linhaParaMeta),
+    (lista) => sincronizarLinhasDoUsuario(TABELA_METAS, userId, lista, metaParaLinha)
+  );
+
   const [modalMetaVisivel, setModalMetaVisivel] = useState(false);
   const [metaEditandoId, setMetaEditandoId] = useState(null);
   const [novoNomeMeta, setNovoNomeMeta] = useState('');
@@ -2371,74 +2779,6 @@ function TelaInvestimentos() {
   const [metaTemData, setMetaTemData] = useState(false);
   const [metaDataSelecionada, setMetaDataSelecionada] = useState(new Date());
   const [mostrarSeletorDataMeta, setMostrarSeletorDataMeta] = useState(false);
-
-  useEffect(() => {
-    async function carregarInvestimentosSalvos() {
-      try {
-        const investimentosCarregados = await buscarLinhasDoUsuario(
-          TABELA_INVESTIMENTOS,
-          userId,
-          linhaParaInvestimento
-        );
-        setInvestimentos(investimentosCarregados);
-      } catch (erro) {
-        console.log('Não foi possível carregar os investimentos salvos:', erro);
-      } finally {
-        setCarregandoInvestimentos(false);
-      }
-    }
-    carregarInvestimentosSalvos();
-  }, [userId]);
-
-  useEffect(() => {
-    if (carregandoInvestimentos) return;
-    sincronizarLinhasDoUsuario(TABELA_INVESTIMENTOS, userId, investimentos, investimentoParaLinha).catch((erro) => {
-      console.log('Não foi possível salvar os investimentos:', erro);
-    });
-  }, [investimentos, carregandoInvestimentos, userId]);
-
-  useEffect(() => {
-    async function carregarMetasSalvas() {
-      try {
-        const metasCarregadas = await buscarLinhasDoUsuario(TABELA_METAS, userId, linhaParaMeta);
-        setMetas(metasCarregadas);
-      } catch (erro) {
-        console.log('Não foi possível carregar as metas salvas:', erro);
-      } finally {
-        setCarregandoMetas(false);
-      }
-    }
-    carregarMetasSalvas();
-  }, [userId]);
-
-  useEffect(() => {
-    if (carregandoMetas) return;
-    sincronizarLinhasDoUsuario(TABELA_METAS, userId, metas, metaParaLinha).catch((erro) => {
-      console.log('Não foi possível salvar as metas:', erro);
-    });
-  }, [metas, carregandoMetas, userId]);
-
-  // Carrega contas fixas e dívidas uma vez só, quando essa aba abre (só
-  // leitura, essa tela não grava nessas duas tabelas). Como as abas são
-  // desmontadas ao trocar, voltar aqui sempre traz os dados mais recentes
-  // das outras telas.
-  useEffect(() => {
-    async function carregarDadosExternos() {
-      try {
-        const [contasCarregadas, dividasCarregadas] = await Promise.all([
-          buscarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, linhaParaContaFixa),
-          buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida),
-        ]);
-        setContasFixas(contasCarregadas);
-        setDividas(dividasCarregadas);
-      } catch (erro) {
-        console.log('Não foi possível carregar dados de outras abas:', erro);
-      } finally {
-        setCarregandoDadosExternos(false);
-      }
-    }
-    carregarDadosExternos();
-  }, [userId]);
 
   const resumo = calcularResumoInvestimentos(investimentos);
   const reserva = calcularReservaEmergencia(investimentos, contasFixas);
@@ -3007,7 +3347,7 @@ function TelaInvestimentos() {
               <>
                 <Text style={styles.helperText}>{t('investimentos.helperDataMeta')}</Text>
                 <TouchableOpacity style={styles.input} onPress={() => setMostrarSeletorDataMeta(true)}>
-                  <Text style={{ fontSize: 14, color: cores.texto }}>{dataParaBR(metaDataSelecionada)}</Text>
+                  <Text style={{ fontSize: 14, fontFamily: FONTES.corpo, color: cores.texto }}>{dataParaBR(metaDataSelecionada)}</Text>
                 </TouchableOpacity>
                 {mostrarSeletorDataMeta && (
                   <SeletorDeData value={metaDataSelecionada} onChange={aoMudarDataMeta} />
@@ -3041,8 +3381,18 @@ function TelaDividas() {
   const { t } = useIdioma();
   const { user } = useAuth();
   const userId = user.id;
-  const [dividas, setDividas] = useState(DIVIDAS_INICIAIS);
-  const [carregandoDividas, setCarregandoDividas] = useState(true);
+  const {
+    dados: dividas,
+    setDados: setDividas,
+    carregando: carregandoDividas,
+  } = useDadosSincronizados(
+    TABELA_DIVIDAS,
+    userId,
+    DIVIDAS_INICIAIS,
+    () => buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida),
+    (lista) => sincronizarLinhasDoUsuario(TABELA_DIVIDAS, userId, lista, dividaParaLinha)
+  );
+
   const [estrategia, setEstrategia] = useState('avalanche');
   const [valorExtraTexto, setValorExtraTexto] = useState('300');
   const [modalVisivel, setModalVisivel] = useState(false);
@@ -3056,33 +3406,8 @@ function TelaDividas() {
   // Quando não é null, o modal está EDITANDO essa dívida (em vez de criar uma nova)
   const [dividaEditandoId, setDividaEditandoId] = useState(null);
 
-  // Assim que a tela abre, tenta carregar dívidas que já tinham sido
-  // salvas antes. Se não tiver nada salvo ainda (primeira vez usando o
-  // app), a lista começa vazia e a pessoa cadastra as dívidas dela.
-  useEffect(() => {
-    async function carregarDividasSalvas() {
-      try {
-        const dividasCarregadas = await buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida);
-        setDividas(dividasCarregadas);
-      } catch (erro) {
-        console.log('Não foi possível carregar as dívidas salvas:', erro);
-      } finally {
-        setCarregandoDividas(false);
-      }
-    }
-    carregarDividasSalvas();
-  }, [userId]);
-
-  // Toda vez que a lista de dívidas mudar (adicionar/remover), salva de
-  // novo no Supabase. O "if (carregandoDividas) return" evita que a gente
-  // sobrescreva o que está salvo com os exemplos iniciais bem no instante
-  // em que o app está abrindo, antes de terminar de carregar.
-  useEffect(() => {
-    if (carregandoDividas) return;
-    sincronizarLinhasDoUsuario(TABELA_DIVIDAS, userId, dividas, dividaParaLinha).catch((erro) => {
-      console.log('Não foi possível salvar as dívidas:', erro);
-    });
-  }, [dividas, carregandoDividas, userId]);
+  // (carregar e salvar ficam por conta do useDadosSincronizados lá em cima:
+  // o cache do aparelho aparece na hora e o Supabase entra em seguida)
 
   // Dívidas já quitadas (saldo zerado ou todas as parcelas pagas) saem da
   // conta de "total devido" e das simulações — elas não competem mais por
@@ -3447,23 +3772,27 @@ function TelaDividas() {
 // ============================================================
 // LOGIN / CADASTRO — tela obrigatória antes de usar o app (Supabase Auth)
 // ============================================================
-// Traduz as mensagens de erro mais comuns do Supabase Auth pra um
-// português mais amigável. Se a mensagem não estiver no mapa, mostra ela
-// do jeito que veio (em inglês) — melhor que travar a tela.
-function traduzirErroAuth(mensagem) {
+// Traduz as mensagens de erro mais comuns do Supabase Auth (que sempre
+// chegam em inglês) pro idioma que a pessoa escolheu. Recebe o "t" de fora
+// porque não é um componente — quem chama é que tem o useIdioma().
+// Se a mensagem não estiver no mapa, mostra ela do jeito que veio (em
+// inglês) — melhor que travar a tela.
+function traduzirErroAuth(mensagem, t) {
   const mapa = {
-    'Invalid login credentials': 'E-mail ou senha incorretos.',
-    'Email not confirmed': 'Confirme seu e-mail antes de entrar (veja sua caixa de entrada).',
-    'User already registered': 'Já existe uma conta com esse e-mail.',
-    'A user with this email address has already been registered': 'Já existe uma conta com esse e-mail.',
-    'Password should be at least 6 characters': 'A senha precisa ter pelo menos 6 caracteres.',
-    'Unable to validate email address: invalid format': 'Digite um e-mail válido.',
+    'Invalid login credentials': 'auth.erros.credenciaisInvalidas',
+    'Email not confirmed': 'auth.erros.emailNaoConfirmado',
+    'User already registered': 'auth.erros.jaCadastrado',
+    'A user with this email address has already been registered': 'auth.erros.jaCadastrado',
+    'Password should be at least 6 characters': 'auth.erros.senhaCurta',
+    'Unable to validate email address: invalid format': 'auth.erros.emailInvalido',
   };
-  return mapa[mensagem] || mensagem;
+  const chave = mapa[mensagem];
+  return chave ? t(chave) : mensagem;
 }
 
 function TelaLogin() {
   const { estilos: styles, cores, escuro } = useTema();
+  const { t } = useIdioma();
   const insets = useSafeAreaInsets();
 
   // "modo" alterna entre entrar numa conta que já existe e criar uma nova
@@ -3478,7 +3807,7 @@ function TelaLogin() {
     setMensagemInfo(null);
 
     if (!emailLimpo || !senha) {
-      avisar('Ops', 'Preencha o e-mail e a senha.');
+      avisar(t('comum.ops'), t('auth.preenchaEmailESenha'));
       return;
     }
 
@@ -3486,22 +3815,20 @@ function TelaLogin() {
     try {
       if (modo === 'login') {
         const { error } = await supabase.auth.signInWithPassword({ email: emailLimpo, password: senha });
-        if (error) avisar('Ops', traduzirErroAuth(error.message));
+        if (error) avisar(t('comum.ops'), traduzirErroAuth(error.message, t));
         // Se der certo, o "onAuthStateChange" (lá em App()) já troca a
         // tela sozinho assim que a sessão aparecer — não precisa fazer
         // nada aqui.
       } else {
         const { error } = await supabase.auth.signUp({ email: emailLimpo, password: senha });
         if (error) {
-          avisar('Ops', traduzirErroAuth(error.message));
+          avisar(t('comum.ops'), traduzirErroAuth(error.message, t));
         } else {
-          setMensagemInfo(
-            'Conta criada! Se pedirmos confirmação por e-mail, dá uma olhada na sua caixa de entrada — senão, você já está logado.'
-          );
+          setMensagemInfo(t('auth.contaCriada'));
         }
       }
     } catch (erro) {
-      avisar('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+      avisar(t('comum.ops'), t('auth.semConexao'));
     } finally {
       setCarregando(false);
     }
@@ -3510,7 +3837,7 @@ function TelaLogin() {
   async function aoEsquecerSenha() {
     const emailLimpo = email.trim();
     if (!emailLimpo) {
-      avisar('Ops', 'Digite seu e-mail ali em cima e toque em "Esqueci minha senha" de novo.');
+      avisar(t('comum.ops'), t('auth.digiteEmailPrimeiro'));
       return;
     }
     setMensagemInfo(null);
@@ -3518,12 +3845,12 @@ function TelaLogin() {
     try {
       const { error } = await supabase.auth.resetPasswordForEmail(emailLimpo);
       if (error) {
-        avisar('Ops', traduzirErroAuth(error.message));
+        avisar(t('comum.ops'), traduzirErroAuth(error.message, t));
       } else {
-        setMensagemInfo('Se esse e-mail tiver uma conta, enviamos um link pra redefinir a senha. Confira sua caixa de entrada.');
+        setMensagemInfo(t('auth.linkEnviado'));
       }
     } catch (erro) {
-      avisar('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+      avisar(t('comum.ops'), t('auth.semConexao'));
     } finally {
       setCarregando(false);
     }
@@ -3556,20 +3883,18 @@ function TelaLogin() {
           >
             <Ionicons name="wallet" size={28} color={cores.primario} />
           </View>
-          <Text style={styles.headerTitle}>Meu Financeiro</Text>
+          <Text style={styles.headerTitle}>{t('auth.tituloApp')}</Text>
           <Text style={[styles.headerSubtitle, { textAlign: 'center' }]}>
-            {modo === 'login'
-              ? 'Entre na sua conta pra continuar cuidando do seu dinheiro'
-              : 'Crie sua conta pra começar a usar o app'}
+            {modo === 'login' ? t('auth.subtituloLogin') : t('auth.subtituloCadastro')}
           </Text>
         </View>
 
-        <Text style={styles.inputLabel}>E-mail</Text>
+        <Text style={styles.inputLabel}>{t('auth.email')}</Text>
         <TextInput
           style={styles.input}
           value={email}
           onChangeText={setEmail}
-          placeholder="seuemail@exemplo.com"
+          placeholder={t('auth.emailPlaceholder')}
           placeholderTextColor={cores.textoMuted}
           autoCapitalize="none"
           autoCorrect={false}
@@ -3577,12 +3902,12 @@ function TelaLogin() {
           editable={!carregando}
         />
 
-        <Text style={styles.inputLabel}>Senha</Text>
+        <Text style={styles.inputLabel}>{t('auth.senha')}</Text>
         <TextInput
           style={styles.input}
           value={senha}
           onChangeText={setSenha}
-          placeholder="Sua senha"
+          placeholder={t('auth.senhaPlaceholder')}
           placeholderTextColor={cores.textoMuted}
           secureTextEntry
           editable={!carregando}
@@ -3600,19 +3925,19 @@ function TelaLogin() {
           disabled={carregando}
         >
           <Text style={styles.modalConfirmButtonText}>
-            {carregando ? 'Só um instante...' : modo === 'login' ? 'Entrar' : 'Criar conta'}
+            {carregando ? t('auth.carregando') : modo === 'login' ? t('auth.entrar') : t('auth.criarConta')}
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={{ marginTop: 20, alignItems: 'center' }} onPress={alternarModo} disabled={carregando}>
           <Text style={styles.addButtonText}>
-            {modo === 'login' ? 'Ainda não tem conta? Criar conta' : 'Já tem conta? Entrar'}
+            {modo === 'login' ? t('auth.irParaCadastro') : t('auth.irParaLogin')}
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={{ marginTop: 14, alignItems: 'center' }} onPress={aoEsquecerSenha} disabled={carregando}>
           <Text style={[styles.helperText, { textDecorationLine: 'underline', marginBottom: 0 }]}>
-            Esqueci minha senha
+            {t('auth.esqueciSenha')}
           </Text>
         </TouchableOpacity>
       </ScrollView>
@@ -3627,6 +3952,7 @@ function TelaLogin() {
 // uma sessão temporária só pra isso. Aqui ela escolhe a senha nova.
 function TelaNovaSenha({ aoTerminar }) {
   const { estilos: styles, cores, escuro } = useTema();
+  const { t } = useIdioma();
   const insets = useSafeAreaInsets();
 
   const [senha, setSenha] = useState('');
@@ -3635,15 +3961,15 @@ function TelaNovaSenha({ aoTerminar }) {
 
   async function salvarNovaSenha() {
     if (!senha || !confirmacao) {
-      avisar('Ops', 'Preencha a nova senha nos dois campos.');
+      avisar(t('comum.ops'), t('auth.preenchaAsDuasSenhas'));
       return;
     }
     if (senha !== confirmacao) {
-      avisar('Ops', 'As duas senhas não são iguais.');
+      avisar(t('comum.ops'), t('auth.senhasDiferentes'));
       return;
     }
     if (senha.length < 6) {
-      avisar('Ops', 'A senha precisa ter pelo menos 6 caracteres.');
+      avisar(t('comum.ops'), t('auth.erros.senhaCurta'));
       return;
     }
 
@@ -3651,13 +3977,13 @@ function TelaNovaSenha({ aoTerminar }) {
     try {
       const { error } = await supabase.auth.updateUser({ password: senha });
       if (error) {
-        avisar('Ops', traduzirErroAuth(error.message));
+        avisar(t('comum.ops'), traduzirErroAuth(error.message, t));
       } else {
-        avisar('Pronto!', 'Sua senha foi alterada.');
+        avisar(t('auth.senhaAlteradaTitulo'), t('auth.senhaAlteradaMensagem'));
         aoTerminar();
       }
     } catch (erro) {
-      avisar('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+      avisar(t('comum.ops'), t('auth.semConexao'));
     } finally {
       setCarregando(false);
     }
@@ -3677,29 +4003,29 @@ function TelaNovaSenha({ aoTerminar }) {
           <View style={[styles.balanceIconWrapper, { backgroundColor: cores.primarioFundo, marginBottom: 16 }]}>
             <Ionicons name="key" size={28} color={cores.primario} />
           </View>
-          <Text style={styles.headerTitle}>Escolher nova senha</Text>
+          <Text style={styles.headerTitle}>{t('auth.novaSenhaTitulo')}</Text>
           <Text style={[styles.headerSubtitle, { textAlign: 'center' }]}>
-            Digite a senha nova duas vezes pra confirmar
+            {t('auth.novaSenhaSubtitulo')}
           </Text>
         </View>
 
-        <Text style={styles.inputLabel}>Nova senha</Text>
+        <Text style={styles.inputLabel}>{t('auth.novaSenha')}</Text>
         <TextInput
           style={styles.input}
           value={senha}
           onChangeText={setSenha}
-          placeholder="Pelo menos 6 caracteres"
+          placeholder={t('auth.novaSenhaPlaceholder')}
           placeholderTextColor={cores.textoMuted}
           secureTextEntry
           editable={!carregando}
         />
 
-        <Text style={styles.inputLabel}>Repita a nova senha</Text>
+        <Text style={styles.inputLabel}>{t('auth.repitaNovaSenha')}</Text>
         <TextInput
           style={styles.input}
           value={confirmacao}
           onChangeText={setConfirmacao}
-          placeholder="Digite de novo"
+          placeholder={t('auth.repitaPlaceholder')}
           placeholderTextColor={cores.textoMuted}
           secureTextEntry
           editable={!carregando}
@@ -3711,10 +4037,71 @@ function TelaNovaSenha({ aoTerminar }) {
           disabled={carregando}
         >
           <Text style={styles.modalConfirmButtonText}>
-            {carregando ? 'Salvando...' : 'Salvar nova senha'}
+            {carregando ? t('auth.salvandoNovaSenha') : t('auth.salvarNovaSenha')}
           </Text>
         </TouchableOpacity>
       </ScrollView>
+    </View>
+  );
+}
+
+// ============================================================
+// FAIXA DE SINCRONIZAÇÃO — o aviso calmo de "ainda não subiu"
+// ============================================================
+// Antes, toda falha de gravação virava um console.log que ninguém lê. Como
+// isso é dinheiro, a pessoa precisa PODER VER que algo não chegou ao
+// servidor — mas sem susto: os dados estão salvos no aparelho, o problema é
+// só a viagem até o servidor.
+//
+// Por isso aqui não tem avisar(...): um soluço de conexão não merece um
+// alerta que trava a tela. É uma faixa fina, do mesmo desenho chapado do
+// resto do app (borda de 1px, sem sombra, fonte Inter), que aparece sozinha
+// e some sozinha quando tudo sincroniza.
+//
+// Dois estados, nessa ordem de prioridade:
+//   1) pendente    — tem alteração que não chegou ao servidor (âmbar, é o
+//                    que a pessoa mais precisa saber)
+//   2) semServidor — nada pendente, mas o servidor não respondeu; a tela
+//                    está mostrando a cópia do aparelho (neutro, com só um
+//                    pontinho verde-água — o verde-água da marca nunca é
+//                    usado como cor de texto no tema claro)
+function BannerDeSincronizacao() {
+  const { estilos: styles, cores } = useTema();
+  const { t } = useIdioma();
+  const { estados } = useSincronizacao();
+
+  const listaDeEstados = Object.keys(estados).map((dominio) => estados[dominio]);
+  const temPendente = listaDeEstados.some((estado) => estado.pendente);
+  const semServidor = listaDeEstados.some((estado) => estado.semServidor);
+
+  if (!temPendente && !semServidor) return null;
+
+  return (
+    <View
+      style={[styles.syncBanner, temPendente ? styles.syncBannerPendente : styles.syncBannerOffline]}
+      accessibilityRole="alert"
+    >
+      {temPendente ? (
+        <Ionicons name="cloud-offline" size={18} color={cores.ambarTextoForte} />
+      ) : (
+        <View style={styles.syncBannerPonto} />
+      )}
+      <View style={{ flex: 1 }}>
+        <Text
+          style={[styles.syncBannerTitulo, { color: temPendente ? cores.ambarTextoForte : cores.texto }]}
+          numberOfLines={2}
+        >
+          {temPendente ? t('sinc.pendenteTitulo') : t('sinc.offlineTitulo')}
+        </Text>
+        <Text
+          style={[
+            styles.syncBannerTexto,
+            { color: temPendente ? cores.ambarTexto : cores.textoSecundario },
+          ]}
+        >
+          {temPendente ? t('sinc.pendenteTexto') : t('sinc.offlineTexto')}
+        </Text>
+      </View>
     </View>
   );
 }
@@ -3846,6 +4233,12 @@ function AppConteudo() {
         )}
       </View>
 
+      {/* Faixa de "ainda não subiu pro servidor". Fica ENTRE o conteúdo e a
+          barra de abas: assim ela nunca cobre a navegação nem flutua por
+          cima do que a pessoa está lendo — só aparece quando tem o que
+          contar, e some sozinha quando tudo sincroniza. */}
+      <BannerDeSincronizacao />
+
       {/* paddingBottom extra = altura real dos botões/gestos do Android
           nesse aparelho específico, então a barra de abas nunca fica
           escondida atrás deles */}
@@ -3859,6 +4252,7 @@ function AppConteudo() {
           <Text style={[styles.tabLabel, abaAtiva === 'inicio' && styles.tabLabelActive]} numberOfLines={1}>
             {t('abas.inicio')}
           </Text>
+          <View style={abaAtiva === 'inicio' ? styles.tabDotAtivo : styles.tabDotEspaco} />
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.tabButton} onPress={() => setAbaAtiva('investimentos')}>
@@ -3870,6 +4264,7 @@ function AppConteudo() {
           <Text style={[styles.tabLabel, abaAtiva === 'investimentos' && styles.tabLabelActive]} numberOfLines={1}>
             {t('abas.investimentos')}
           </Text>
+          <View style={abaAtiva === 'investimentos' ? styles.tabDotAtivo : styles.tabDotEspaco} />
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.tabButton} onPress={() => setAbaAtiva('dividas')}>
@@ -3881,6 +4276,7 @@ function AppConteudo() {
           <Text style={[styles.tabLabel, abaAtiva === 'dividas' && styles.tabLabelActive]} numberOfLines={1}>
             {t('abas.dividas')}
           </Text>
+          <View style={abaAtiva === 'dividas' ? styles.tabDotAtivo : styles.tabDotEspaco} />
         </TouchableOpacity>
       </View>
 
@@ -3969,10 +4365,24 @@ const CHAVE_ARMAZENAMENTO_TEMA = '@meu-financeiro:temaEscuro';
 const CHAVE_ARMAZENAMENTO_IDIOMA = '@meu-financeiro:idioma';
 
 export default function App() {
-  // Começa no modo escuro por padrão. Se a pessoa já tiver escolhido um
-  // tema antes (ver useEffect abaixo), a preferência salva é que manda.
-  const [escuro, setEscuro] = useState(true);
+  // Começa no modo claro por padrão — é o visual pimble (fundo #F8FAFC,
+  // cartões brancos, marinho + verde-água). Se a pessoa já tiver escolhido
+  // um tema antes (ver useEffect abaixo), a preferência salva é que manda.
+  const [escuro, setEscuro] = useState(false);
   const [carregandoTema, setCarregandoTema] = useState(true);
+
+  // ---- Fontes da marca (Comfortaa + Inter) ----
+  // Enquanto elas não chegam, mostramos a mesma tela de "Carregando..."
+  // usada na checagem de sessão, pra não renderizar o app meio estilizado.
+  const [fontesCarregadas, erroFontes] = useFonts(FONTES_PARA_CARREGAR);
+  // Rede ruim não pode travar o app pra sempre: passou do tempo, entra
+  // assim mesmo e o sistema usa a fonte padrão dele.
+  const [tempoDeFonteEsgotado, setTempoDeFonteEsgotado] = useState(false);
+  useEffect(() => {
+    const relogio = setTimeout(() => setTempoDeFonteEsgotado(true), 4000);
+    return () => clearTimeout(relogio);
+  }, []);
+  const fontesProntas = fontesCarregadas || Boolean(erroFontes) || tempoDeFonteEsgotado;
   const [idioma, setIdioma] = useState('pt');
   const [carregandoIdioma, setCarregandoIdioma] = useState(true);
 
@@ -4085,15 +4495,21 @@ export default function App() {
       <TemaContext.Provider value={valorTema}>
         <IdiomaContext.Provider value={valorIdioma}>
           <ProvedorDeAvisos>
-            {carregandoSessao ? (
+            {carregandoSessao || !fontesProntas ? (
               <View style={valorTema.estilos.loadingContainer}>
-                <Text style={valorTema.estilos.loadingText}>Carregando...</Text>
+                <Text style={valorTema.estilos.loadingText}>{valorIdioma.t('comum.carregando')}</Text>
               </View>
             ) : session && redefinindoSenha ? (
               <TelaNovaSenha aoTerminar={() => setRedefinindoSenha(false)} />
             ) : session ? (
               <AuthContext.Provider value={valorAuth}>
-                <AppConteudo />
+                {/* O provedor de sincronização precisa ficar por FORA das
+                    abas: as telas são desmontadas ao trocar de aba, e o
+                    "tem coisa pendente" tem que continuar valendo mesmo
+                    assim (é o que mantém a faixa de aviso na tela). */}
+                <ProvedorDeSincronizacao>
+                  <AppConteudo />
+                </ProvedorDeSincronizacao>
               </AuthContext.Provider>
             ) : (
               <TelaLogin />
@@ -4106,103 +4522,141 @@ export default function App() {
 }
 
 // ============================================================
-// TEMA (cores) — claro e escuro
+// TEMA (cores) — claro e escuro, na paleta da marca pimble
 // ============================================================
 // Em vez de cores fixas espalhadas pelo código, cada cor tem um "nome"
 // (ex: cores.texto, cores.fundoCard) e existe uma versão clara e uma
 // escura pra cada nome. "criarEstilos" monta o StyleSheet a partir de
 // um desses dois conjuntos — é isso que faz a tela escura funcionar.
+//
+// As duas cores da marca têm papéis DIFERENTES, e isso importa:
+//
+//   cores.primario  = a cor de ação "cheia". No tema claro é o azul-marinho
+//                     #0F172A (botões preenchidos com texto branco, ícone da
+//                     aba ativa, números em destaque). No tema escuro o
+//                     marinho vira o próprio fundo, então lá o primário é o
+//                     verde-água #00C4B4 — e o texto em cima dele é marinho.
+//
+//   cores.destaque  = o verde-água #00C4B4 da marca, nos DOIS temas, usado
+//                     SÓ como forma preenchida: o pontinho embaixo da aba
+//                     ativa, a ponta das barras de progresso, o sublinhado
+//                     do item selecionado, selinhos pequenos.
+//
+// Regra de acessibilidade (tema claro): #00C4B4 sobre branco tem contraste
+// de apenas 2.2:1 — ilegível. Por isso "cores.destaque" NUNCA é usado como
+// cor de texto, de traço de ícone ou de linha fina no tema claro. Texto em
+// cima de um preenchimento verde-água é sempre marinho (cores.textoSobre-
+// Primario). Quando bate a vontade de "texto verde-água", o certo é texto
+// marinho + um pontinho/sublinhado verde-água do lado.
+
+// O verde-água da marca é o mesmo nos dois temas, então o texto que fica
+// EM CIMA dele também é sempre o mesmo: o marinho da marca. Por isso essa
+// constante vive fora das paletas (não é um token de tema).
+const MARINHO_DA_MARCA = '#0F172A';
 
 const TEMA_CLARO = {
-  fundo: '#f8fafc',
-  fundoCard: '#ffffff',
-  fundoSutil: '#f1f5f9',
-  texto: '#0f172a',
-  textoSecundario: '#64748b',
+  fundo: '#F8FAFC',
+  fundoCard: '#FFFFFF',
+  fundoSutil: '#F1F5F9',
+  texto: '#0F172A',
+  textoSecundario: '#64748B',
   textoLabel: '#334155',
-  textoMuted: '#94a3b8',
+  textoMuted: '#94A3B8',
   textoEmptyTitle: '#475569',
-  borda: '#e2e8f0',
+  borda: '#E2E8F0',
   overlay: 'rgba(15, 23, 42, 0.5)',
-  sombra: '#000',
-  branco: '#ffffff',
+  // O desenho é chapado, sem sombra nenhuma — o token continua existindo
+  // só pra não quebrar quem ainda o referencia.
+  sombra: 'transparent',
+  branco: '#FFFFFF',
 
-  primario: '#4338ca',
-  primarioFundo: '#eef2ff',
-  primarioFundoBorda: '#c7d2fe',
+  // Ação cheia = marinho da marca.
+  primario: '#0F172A',
+  primarioFundo: '#F1F5F9',
+  primarioFundoBorda: '#CBD5E1',
+  // Cor do texto/ícone que fica EM CIMA de um preenchimento "primario".
+  textoSobrePrimario: '#FFFFFF',
 
-  verde: '#16a34a',
-  verdeFundo: '#f0fdf4',
-  verdeBorda: '#bbf7d0',
-  verdeFundoSuave: '#dcfce7',
-  verdeBordaSuave: '#86efac',
-  verdeTextoForte: '#166534',
+  // Acento da marca — só como forma preenchida, nunca como texto.
+  destaque: '#00C4B4',
 
-  vermelho: '#dc2626',
-  vermelhoFundo: '#fef2f2',
-  vermelhoBorda: '#fecaca',
-  vermelhoTextoForte: '#991b1b',
+  verde: '#059669',
+  verdeFundo: '#ECFDF5',
+  verdeBorda: '#A7F3D0',
+  verdeFundoSuave: '#D1FAE5',
+  verdeBordaSuave: '#6EE7B7',
+  verdeTextoForte: '#047857',
 
-  amarelo: '#ca8a04',
-  amareloFundo: '#fefce8',
+  vermelho: '#E11D48',
+  vermelhoFundo: '#FFF1F2',
+  vermelhoBorda: '#FECDD3',
+  vermelhoTextoForte: '#9F1239',
 
-  ambar: '#d97706',
-  ambarFundo: '#fffbeb',
-  ambarBorda: '#fde68a',
-  ambarTextoForte: '#92400e',
-  ambarTexto: '#b45309',
+  amarelo: '#D97706',
+  amareloFundo: '#FFFBEB',
 
-  laranjaForte: '#f97316',
-  laranjaFundo: '#fff7ed',
-  laranjaBorda: '#fdba74',
-  laranjaTextoForte: '#7c2d12',
-  laranjaTexto: '#9a3412',
+  ambar: '#D97706',
+  ambarFundo: '#FFFBEB',
+  ambarBorda: '#FDE68A',
+  ambarTextoForte: '#92400E',
+  ambarTexto: '#B45309',
+
+  laranjaForte: '#EA580C',
+  laranjaFundo: '#FFF7ED',
+  laranjaBorda: '#FED7AA',
+  laranjaTextoForte: '#7C2D12',
+  laranjaTexto: '#9A3412',
 };
 
 const TEMA_ESCURO = {
-  fundo: '#0f172a',
-  fundoCard: '#1e293b',
-  fundoSutil: '#273549',
-  texto: '#f1f5f9',
-  textoSecundario: '#94a3b8',
-  textoLabel: '#cbd5e1',
-  textoMuted: '#64748b',
-  textoEmptyTitle: '#cbd5e1',
+  fundo: '#0F172A',
+  fundoCard: '#1E293B',
+  fundoSutil: '#334155',
+  texto: '#F8FAFC',
+  textoSecundario: '#94A3B8',
+  textoLabel: '#CBD5E1',
+  textoMuted: '#64748B',
+  textoEmptyTitle: '#CBD5E1',
   borda: '#334155',
-  overlay: 'rgba(0, 0, 0, 0.6)',
-  sombra: '#000',
-  branco: '#ffffff',
+  overlay: 'rgba(2, 6, 23, 0.7)',
+  sombra: 'transparent',
+  branco: '#FFFFFF',
 
-  primario: '#818cf8',
-  primarioFundo: '#312e81',
-  primarioFundoBorda: '#4338ca',
+  // No escuro o marinho é o fundo, então a ação cheia vira o verde-água —
+  // que aqui tem contraste de sobra — com texto marinho em cima.
+  primario: '#00C4B4',
+  primarioFundo: '#0B3D3A',
+  primarioFundoBorda: '#0F766E',
+  textoSobrePrimario: '#0F172A',
 
-  verde: '#4ade80',
-  verdeFundo: '#052e1a',
-  verdeBorda: '#14532d',
-  verdeFundoSuave: '#0f2919',
-  verdeBordaSuave: '#166534',
-  verdeTextoForte: '#86efac',
+  destaque: '#00C4B4',
 
-  vermelho: '#f87171',
-  vermelhoFundo: '#2a0a0a',
-  vermelhoBorda: '#7f1d1d',
-  vermelhoTextoForte: '#fca5a5',
+  verde: '#34D399',
+  verdeFundo: '#052E23',
+  verdeBorda: '#065F46',
+  verdeFundoSuave: '#064E3B',
+  verdeBordaSuave: '#10B981',
+  verdeTextoForte: '#6EE7B7',
 
-  amarelo: '#eab308',
-  amareloFundo: '#2d2a0a',
+  vermelho: '#FB7185',
+  vermelhoFundo: '#3F0A1B',
+  vermelhoBorda: '#9F1239',
+  vermelhoTextoForte: '#FDA4AF',
 
-  ambar: '#f59e0b',
-  ambarFundo: '#2a2004',
-  ambarBorda: '#78350f',
-  ambarTextoForte: '#fcd34d',
-  ambarTexto: '#fbbf24',
+  amarelo: '#FBBF24',
+  amareloFundo: '#3A2A06',
 
-  laranjaForte: '#f97316',
-  laranjaFundo: '#2a1a0a',
-  laranjaBorda: '#9a3412',
-  laranjaTextoForte: '#fed7aa',
-  laranjaTexto: '#fb923c',
+  ambar: '#FBBF24',
+  ambarFundo: '#3A2A06',
+  ambarBorda: '#92400E',
+  ambarTextoForte: '#FCD34D',
+  ambarTexto: '#FBBF24',
+
+  laranjaForte: '#FB923C',
+  laranjaFundo: '#3A1F0A',
+  laranjaBorda: '#9A3412',
+  laranjaTextoForte: '#FED7AA',
+  laranjaTexto: '#FDBA74',
 };
 
 // Contexto do tema: guarda se está escuro, a paleta de cores atual, os
@@ -4296,6 +4750,7 @@ const TRADUCOES = {
       nao: 'Não',
       remover: 'Remover',
       ops: 'Ops',
+      carregando: 'Carregando...',
       nome: 'Nome',
       escolhida: '✓ Escolhida',
       xDeY: '{{x}} de {{y}}',
@@ -4321,6 +4776,57 @@ const TRADUCOES = {
       sair: 'Sair',
       confirmarSairTitulo: 'Sair da conta',
       confirmarSairMensagem: 'Tem certeza que quer sair? Você vai precisar entrar de novo com seu e-mail e senha.',
+    },
+    // Login / cadastro / nova senha. O tom aqui é de propósito o mesmo do
+    // resto do app: simples, direto e sem juridiquês.
+    auth: {
+      // Nome do produto — igual nos três idiomas, nome próprio não se traduz.
+      tituloApp: 'Meu Financeiro',
+      subtituloLogin: 'Entre na sua conta pra continuar cuidando do seu dinheiro',
+      subtituloCadastro: 'Crie sua conta pra começar a usar o app',
+      email: 'E-mail',
+      emailPlaceholder: 'seuemail@exemplo.com',
+      senha: 'Senha',
+      senhaPlaceholder: 'Sua senha',
+      entrar: 'Entrar',
+      criarConta: 'Criar conta',
+      carregando: 'Só um instante...',
+      irParaCadastro: 'Ainda não tem conta? Criar conta',
+      irParaLogin: 'Já tem conta? Entrar',
+      esqueciSenha: 'Esqueci minha senha',
+      preenchaEmailESenha: 'Preencha o e-mail e a senha.',
+      contaCriada:
+        'Conta criada! Se pedirmos confirmação por e-mail, dá uma olhada na sua caixa de entrada — senão, você já está logado.',
+      digiteEmailPrimeiro: 'Digite seu e-mail ali em cima e toque em "Esqueci minha senha" de novo.',
+      linkEnviado: 'Se esse e-mail tiver uma conta, enviamos um link pra redefinir a senha. Confira sua caixa de entrada.',
+      semConexao: 'Não foi possível conectar. Verifique sua internet e tente de novo.',
+      novaSenhaTitulo: 'Escolher nova senha',
+      novaSenhaSubtitulo: 'Digite a senha nova duas vezes pra confirmar',
+      novaSenha: 'Nova senha',
+      novaSenhaPlaceholder: 'Pelo menos 6 caracteres',
+      repitaNovaSenha: 'Repita a nova senha',
+      repitaPlaceholder: 'Digite de novo',
+      salvarNovaSenha: 'Salvar nova senha',
+      salvandoNovaSenha: 'Salvando...',
+      preenchaAsDuasSenhas: 'Preencha a nova senha nos dois campos.',
+      senhasDiferentes: 'As duas senhas não são iguais.',
+      senhaAlteradaTitulo: 'Pronto!',
+      senhaAlteradaMensagem: 'Sua senha foi alterada.',
+      // Mensagens do Supabase Auth, que chegam sempre em inglês
+      erros: {
+        credenciaisInvalidas: 'E-mail ou senha incorretos.',
+        emailNaoConfirmado: 'Confirme seu e-mail antes de entrar (veja sua caixa de entrada).',
+        jaCadastrado: 'Já existe uma conta com esse e-mail.',
+        senhaCurta: 'A senha precisa ter pelo menos 6 caracteres.',
+        emailInvalido: 'Digite um e-mail válido.',
+      },
+    },
+    // Faixa fina que avisa quando algo ainda não chegou ao servidor
+    sinc: {
+      pendenteTitulo: 'Ainda não enviamos pro servidor',
+      pendenteTexto: 'Seus dados estão salvos neste aparelho. A gente envia sozinho assim que a conexão voltar.',
+      offlineTitulo: 'Sem conexão com o servidor',
+      offlineTexto: 'Você está vendo a cópia salva neste aparelho. Está tudo aqui.',
     },
     dividas: {
       saldoDevedor: 'Saldo devedor',
@@ -4572,6 +5078,7 @@ const TRADUCOES = {
       nao: 'No',
       remover: 'Remove',
       ops: 'Oops',
+      carregando: 'Loading...',
       nome: 'Name',
       escolhida: '✓ Selected',
       xDeY: '{{x}} of {{y}}',
@@ -4597,6 +5104,52 @@ const TRADUCOES = {
       sair: 'Log out',
       confirmarSairTitulo: 'Log out',
       confirmarSairMensagem: 'Are you sure you want to log out? You will need to sign in again with your email and password.',
+    },
+    auth: {
+      tituloApp: 'Meu Financeiro',
+      subtituloLogin: 'Sign in to keep taking care of your money',
+      subtituloCadastro: 'Create your account to start using the app',
+      email: 'Email',
+      emailPlaceholder: 'youremail@example.com',
+      senha: 'Password',
+      senhaPlaceholder: 'Your password',
+      entrar: 'Sign in',
+      criarConta: 'Create account',
+      carregando: 'Just a second...',
+      irParaCadastro: "Don't have an account yet? Create one",
+      irParaLogin: 'Already have an account? Sign in',
+      esqueciSenha: 'I forgot my password',
+      preenchaEmailESenha: 'Fill in your email and password.',
+      contaCriada:
+        'Account created! If we ask you to confirm by email, take a look at your inbox — otherwise, you are already signed in.',
+      digiteEmailPrimeiro: 'Type your email up there and tap "I forgot my password" again.',
+      linkEnviado: 'If that email has an account, we sent a link to reset the password. Check your inbox.',
+      semConexao: "Couldn't connect. Check your internet and try again.",
+      novaSenhaTitulo: 'Choose a new password',
+      novaSenhaSubtitulo: 'Type the new password twice to confirm',
+      novaSenha: 'New password',
+      novaSenhaPlaceholder: 'At least 6 characters',
+      repitaNovaSenha: 'Repeat the new password',
+      repitaPlaceholder: 'Type it again',
+      salvarNovaSenha: 'Save new password',
+      salvandoNovaSenha: 'Saving...',
+      preenchaAsDuasSenhas: 'Fill in the new password in both fields.',
+      senhasDiferentes: 'The two passwords are not the same.',
+      senhaAlteradaTitulo: 'All set!',
+      senhaAlteradaMensagem: 'Your password has been changed.',
+      erros: {
+        credenciaisInvalidas: 'Wrong email or password.',
+        emailNaoConfirmado: 'Confirm your email before signing in (check your inbox).',
+        jaCadastrado: 'There is already an account with that email.',
+        senhaCurta: 'The password needs at least 6 characters.',
+        emailInvalido: 'Type a valid email.',
+      },
+    },
+    sinc: {
+      pendenteTitulo: "We haven't sent this to the server yet",
+      pendenteTexto: 'Your data is saved on this device. We will send it on its own as soon as the connection is back.',
+      offlineTitulo: 'No connection to the server',
+      offlineTexto: 'You are seeing the copy saved on this device. Everything is here.',
     },
     dividas: {
       saldoDevedor: 'Outstanding balance',
@@ -4848,6 +5401,7 @@ const TRADUCOES = {
       nao: 'No',
       remover: 'Eliminar',
       ops: 'Ups',
+      carregando: 'Cargando...',
       nome: 'Nombre',
       escolhida: '✓ Elegida',
       xDeY: '{{x}} de {{y}}',
@@ -4873,6 +5427,52 @@ const TRADUCOES = {
       sair: 'Cerrar sesión',
       confirmarSairTitulo: 'Cerrar sesión',
       confirmarSairMensagem: '¿Seguro que quieres cerrar sesión? Vas a tener que entrar de nuevo con tu correo y contraseña.',
+    },
+    auth: {
+      tituloApp: 'Meu Financeiro',
+      subtituloLogin: 'Entra en tu cuenta para seguir cuidando tu dinero',
+      subtituloCadastro: 'Crea tu cuenta para empezar a usar la app',
+      email: 'Correo',
+      emailPlaceholder: 'tucorreo@ejemplo.com',
+      senha: 'Contraseña',
+      senhaPlaceholder: 'Tu contraseña',
+      entrar: 'Entrar',
+      criarConta: 'Crear cuenta',
+      carregando: 'Un momentito...',
+      irParaCadastro: '¿Todavía no tienes cuenta? Crear cuenta',
+      irParaLogin: '¿Ya tienes cuenta? Entrar',
+      esqueciSenha: 'Olvidé mi contraseña',
+      preenchaEmailESenha: 'Completa el correo y la contraseña.',
+      contaCriada:
+        '¡Cuenta creada! Si te pedimos confirmación por correo, échale un ojo a tu bandeja de entrada — si no, ya estás dentro.',
+      digiteEmailPrimeiro: 'Escribe tu correo ahí arriba y toca "Olvidé mi contraseña" de nuevo.',
+      linkEnviado: 'Si ese correo tiene una cuenta, te enviamos un enlace para restablecer la contraseña. Revisa tu bandeja de entrada.',
+      semConexao: 'No fue posible conectar. Revisa tu internet e inténtalo de nuevo.',
+      novaSenhaTitulo: 'Elegir contraseña nueva',
+      novaSenhaSubtitulo: 'Escribe la contraseña nueva dos veces para confirmar',
+      novaSenha: 'Contraseña nueva',
+      novaSenhaPlaceholder: 'Al menos 6 caracteres',
+      repitaNovaSenha: 'Repite la contraseña nueva',
+      repitaPlaceholder: 'Escríbela de nuevo',
+      salvarNovaSenha: 'Guardar contraseña nueva',
+      salvandoNovaSenha: 'Guardando...',
+      preenchaAsDuasSenhas: 'Completa la contraseña nueva en los dos campos.',
+      senhasDiferentes: 'Las dos contraseñas no son iguales.',
+      senhaAlteradaTitulo: '¡Listo!',
+      senhaAlteradaMensagem: 'Tu contraseña fue cambiada.',
+      erros: {
+        credenciaisInvalidas: 'Correo o contraseña incorrectos.',
+        emailNaoConfirmado: 'Confirma tu correo antes de entrar (revisa tu bandeja de entrada).',
+        jaCadastrado: 'Ya existe una cuenta con ese correo.',
+        senhaCurta: 'La contraseña necesita al menos 6 caracteres.',
+        emailInvalido: 'Escribe un correo válido.',
+      },
+    },
+    sinc: {
+      pendenteTitulo: 'Todavía no lo enviamos al servidor',
+      pendenteTexto: 'Tus datos están guardados en este aparato. Lo enviamos solito en cuanto vuelva la conexión.',
+      offlineTitulo: 'Sin conexión con el servidor',
+      offlineTexto: 'Estás viendo la copia guardada en este aparato. Está todo aquí.',
     },
     dividas: {
       saldoDevedor: 'Saldo pendiente',
@@ -5127,7 +5727,7 @@ function criarEstilos(cores) {
       backgroundColor: cores.fundo,
     },
     listContent: {
-      paddingHorizontal: 20,
+      paddingHorizontal: 24,
       paddingBottom: 24,
     },
 
@@ -5135,60 +5735,60 @@ function criarEstilos(cores) {
     topBar: {
       flexDirection: 'row',
       justifyContent: 'flex-end',
-      paddingHorizontal: 20,
-      paddingTop: 6,
+      paddingHorizontal: 24,
+      paddingTop: 8,
     },
 
     // Cabeçalho
     headerTitle: {
       fontSize: 26,
+      fontFamily: FONTES.marcaBold,
       fontWeight: '700',
       color: cores.texto,
-      marginTop: Platform.OS === 'android' ? 12 : 4,
+      marginTop: Platform.OS === 'android' ? 16 : 8,
     },
     headerSubtitle: {
       fontSize: 14,
+      fontFamily: FONTES.corpo,
       color: cores.textoSecundario,
-      marginTop: 2,
-      marginBottom: 20,
+      marginTop: 4,
+      marginBottom: 24,
     },
 
-    // Card de Saldo Total (aba Início)
+    // Card de Saldo Total (aba Início) — chapado, sem sombra
     balanceCard: {
       backgroundColor: cores.primario,
       borderRadius: 20,
-      padding: 22,
+      padding: 24,
       marginBottom: 16,
-      shadowColor: cores.primario,
-      shadowOffset: { width: 0, height: 8 },
-      shadowOpacity: 0.25,
-      shadowRadius: 12,
-      elevation: 6,
     },
     balanceIconWrapper: {
       width: 40,
       height: 40,
       borderRadius: 12,
-      backgroundColor: 'rgba(255,255,255,0.18)',
+      backgroundColor: 'rgba(255,255,255,0.16)',
       alignItems: 'center',
       justifyContent: 'center',
-      marginBottom: 14,
+      marginBottom: 16,
     },
     balanceLabel: {
       fontSize: 14,
-      color: 'rgba(255,255,255,0.85)',
-      marginBottom: 6,
+      fontFamily: FONTES.corpo,
+      color: cores.textoSobrePrimario,
+      opacity: 0.85,
+      marginBottom: 8,
     },
     balanceValue: {
       fontSize: 32,
+      fontFamily: FONTES.marcaBold,
       fontWeight: '700',
-      color: cores.branco,
+      color: cores.textoSobrePrimario,
     },
 
     // Cards de Entradas e Saídas (aba Início)
     row: {
       flexDirection: 'row',
-      gap: 12,
+      gap: 16,
       marginBottom: 24,
     },
     smallCard: {
@@ -5212,16 +5812,19 @@ function criarEstilos(cores) {
     },
     smallCardLabel: {
       fontSize: 13,
+      fontFamily: FONTES.corpoSemi,
       fontWeight: '600',
       color: cores.textoLabel,
-      marginLeft: 6,
+      marginLeft: 8,
     },
     smallCardValue: {
       fontSize: 18,
+      fontFamily: FONTES.marcaBold,
       fontWeight: '700',
     },
     smallCardPeriodo: {
       fontSize: 11,
+      fontFamily: FONTES.corpo,
       color: cores.textoMuted,
       marginTop: 2,
     },
@@ -5230,7 +5833,7 @@ function criarEstilos(cores) {
     dailyBudgetCard: {
       borderRadius: 16,
       padding: 16,
-      marginBottom: 12,
+      marginBottom: 16,
       borderWidth: 1,
     },
     dailyBudgetCardVerde: {
@@ -5245,17 +5848,33 @@ function criarEstilos(cores) {
       backgroundColor: cores.vermelhoFundo,
       borderColor: cores.vermelho,
     },
-    dailyBudgetLabel: { fontSize: 13, fontWeight: '600', color: cores.textoLabel },
-    dailyBudgetValue: { fontSize: 26, fontWeight: '700', color: cores.texto, marginTop: 4 },
-    dailyBudgetSubtitle: { fontSize: 12, color: cores.textoSecundario, marginTop: 6 },
+    dailyBudgetLabel: {
+      fontSize: 13,
+      fontFamily: FONTES.corpoSemi,
+      fontWeight: '600',
+      color: cores.textoLabel,
+    },
+    dailyBudgetValue: {
+      fontSize: 26,
+      fontFamily: FONTES.marcaBold,
+      fontWeight: '700',
+      color: cores.texto,
+      marginTop: 8,
+    },
+    dailyBudgetSubtitle: {
+      fontSize: 12,
+      fontFamily: FONTES.corpo,
+      color: cores.textoSecundario,
+      marginTop: 8,
+    },
 
     // "Alerta de mês estranho"
     alertaMesCard: {
       flexDirection: 'row',
       alignItems: 'center',
-      borderRadius: 14,
-      padding: 14,
-      marginBottom: 12,
+      borderRadius: 16,
+      padding: 16,
+      marginBottom: 16,
       borderWidth: 1,
     },
     alertaMesCardAlto: {
@@ -5266,15 +5885,15 @@ function criarEstilos(cores) {
       backgroundColor: cores.verdeFundo,
       borderColor: cores.verde,
     },
-    alertaMesTitulo: { fontSize: 14, fontWeight: '700' },
-    alertaMesSubtitulo: { fontSize: 12, marginTop: 2, lineHeight: 17 },
+    alertaMesTitulo: { fontSize: 14, fontFamily: FONTES.corpoBold, fontWeight: '700' },
+    alertaMesSubtitulo: { fontSize: 12, fontFamily: FONTES.corpo, marginTop: 4, lineHeight: 18 },
 
     // "Posso comprar isso?"
     purchaseResultBox: {
-      borderRadius: 14,
-      padding: 14,
-      marginTop: 4,
-      marginBottom: 14,
+      borderRadius: 16,
+      padding: 16,
+      marginTop: 8,
+      marginBottom: 16,
       borderWidth: 1,
     },
     purchaseResultBoxVerde: {
@@ -5289,23 +5908,29 @@ function criarEstilos(cores) {
       backgroundColor: cores.vermelhoFundo,
       borderColor: cores.vermelho,
     },
-    purchaseResultTitle: { fontSize: 14, fontWeight: '700', color: cores.texto },
-    purchaseResultText: { fontSize: 12, color: cores.textoSecundario, marginTop: 4, lineHeight: 17 },
+    purchaseResultTitle: { fontSize: 14, fontFamily: FONTES.corpoBold, fontWeight: '700', color: cores.texto },
+    purchaseResultText: {
+      fontSize: 12,
+      fontFamily: FONTES.corpo,
+      color: cores.textoSecundario,
+      marginTop: 8,
+      lineHeight: 18,
+    },
 
     // "Máquina do Tempo" — projeção de saldo
     timeMachineCard: {
       backgroundColor: cores.fundoCard,
       borderRadius: 16,
       padding: 16,
-      marginBottom: 12,
+      marginBottom: 16,
       borderWidth: 1,
       borderColor: cores.borda,
     },
-    timeMachineTexto: { fontSize: 13, color: cores.textoLabel, marginBottom: 4 },
+    timeMachineTexto: { fontSize: 13, fontFamily: FONTES.corpo, color: cores.textoLabel, marginBottom: 8 },
     timeMachineProjecaoCard: {
       flex: 1,
       borderRadius: 12,
-      padding: 12,
+      padding: 16,
       borderWidth: 1,
     },
     timeMachineProjecaoPositiva: {
@@ -5316,20 +5941,32 @@ function criarEstilos(cores) {
       backgroundColor: cores.vermelhoFundo,
       borderColor: cores.vermelho,
     },
-    timeMachineProjecaoLabel: { fontSize: 12, color: cores.textoSecundario },
-    timeMachineProjecaoValor: { fontSize: 16, fontWeight: '700', color: cores.texto, marginTop: 4 },
+    timeMachineProjecaoLabel: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario },
+    timeMachineProjecaoValor: {
+      fontSize: 16,
+      fontFamily: FONTES.marcaBold,
+      fontWeight: '700',
+      color: cores.texto,
+      marginTop: 8,
+    },
 
     // Prévia da compra parcelada (dentro do modal de nova transação)
     previaParcelamentoBox: {
       backgroundColor: cores.fundoSutil,
       borderRadius: 12,
-      padding: 12,
+      padding: 16,
       marginTop: 8,
       borderWidth: 1,
       borderColor: cores.borda,
     },
-    previaParcelamentoTitulo: { fontSize: 13, fontWeight: '700', color: cores.textoLabel, marginBottom: 6 },
-    previaParcelamentoLinha: { fontSize: 13, color: cores.textoLabel, marginTop: 2 },
+    previaParcelamentoTitulo: {
+      fontSize: 13,
+      fontFamily: FONTES.corpoBold,
+      fontWeight: '700',
+      color: cores.textoLabel,
+      marginBottom: 8,
+    },
+    previaParcelamentoLinha: { fontSize: 13, fontFamily: FONTES.corpo, color: cores.textoLabel, marginTop: 4 },
 
     // "Sequência sem estourar"
     streakCard: {
@@ -5337,26 +5974,28 @@ function criarEstilos(cores) {
       alignItems: 'center',
       backgroundColor: cores.laranjaFundo,
       borderRadius: 16,
-      padding: 14,
-      marginBottom: 12,
+      padding: 16,
+      marginBottom: 16,
       borderWidth: 1,
       borderColor: cores.laranjaBorda,
     },
-    streakTexto: { fontSize: 14, fontWeight: '600', color: cores.laranjaTextoForte },
-    streakRecorde: { fontSize: 12, color: cores.laranjaTexto, marginTop: 2 },
+    streakTexto: { fontSize: 14, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.laranjaTextoForte },
+    streakRecorde: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.laranjaTexto, marginTop: 2 },
 
     sectionTitle: {
       fontSize: 17,
+      fontFamily: FONTES.marcaBold,
       fontWeight: '700',
       color: cores.texto,
-      marginTop: 8,
-      marginBottom: 10,
+      marginTop: 24,
+      marginBottom: 12,
     },
     helperText: {
       fontSize: 13,
+      fontFamily: FONTES.corpo,
       color: cores.textoSecundario,
-      marginBottom: 14,
-      lineHeight: 18,
+      marginBottom: 16,
+      lineHeight: 19,
     },
 
     // Item de transação (aba Início)
@@ -5364,9 +6003,9 @@ function criarEstilos(cores) {
       flexDirection: 'row',
       alignItems: 'center',
       backgroundColor: cores.fundoCard,
-      borderRadius: 14,
-      padding: 14,
-      marginBottom: 10,
+      borderRadius: 16,
+      padding: 16,
+      marginBottom: 8,
       borderWidth: 1,
       borderColor: cores.borda,
     },
@@ -5375,26 +6014,38 @@ function criarEstilos(cores) {
       borderStyle: 'dashed',
     },
     transactionIconWrapper: {
-      width: 36,
-      height: 36,
-      borderRadius: 10,
+      width: 40,
+      height: 40,
+      borderRadius: 12,
       backgroundColor: cores.fundoSutil,
       alignItems: 'center',
       justifyContent: 'center',
-      marginRight: 12,
+      marginRight: 16,
     },
     transactionInfo: { flex: 1 },
-    transactionTitle: { fontSize: 14, fontWeight: '600', color: cores.texto },
-    transactionDate: { fontSize: 12, color: cores.textoMuted, marginTop: 2 },
-    transactionValue: { fontSize: 14, fontWeight: '700' },
+    transactionTitle: { fontSize: 14, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.texto },
+    transactionDate: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoMuted, marginTop: 2 },
+    transactionValue: { fontSize: 14, fontFamily: FONTES.corpoBold, fontWeight: '700' },
 
     emptyContainer: {
       alignItems: 'center',
       justifyContent: 'center',
       paddingVertical: 48,
     },
-    emptyTitle: { fontSize: 15, fontWeight: '600', color: cores.textoEmptyTitle, marginTop: 12 },
-    emptySubtitle: { fontSize: 13, color: cores.textoMuted, marginTop: 4, textAlign: 'center' },
+    emptyTitle: {
+      fontSize: 15,
+      fontFamily: FONTES.corpoSemi,
+      fontWeight: '600',
+      color: cores.textoEmptyTitle,
+      marginTop: 16,
+    },
+    emptySubtitle: {
+      fontSize: 13,
+      fontFamily: FONTES.corpo,
+      color: cores.textoMuted,
+      marginTop: 8,
+      textAlign: 'center',
+    },
 
     loadingContainer: {
       flex: 1,
@@ -5402,15 +6053,17 @@ function criarEstilos(cores) {
       justifyContent: 'center',
       backgroundColor: cores.fundo,
     },
-    loadingText: { fontSize: 14, color: cores.textoMuted },
+    loadingText: { fontSize: 14, fontFamily: FONTES.corpo, color: cores.textoMuted },
 
     // Título de cada mês no histórico agrupado
     monthSectionHeader: {
       fontSize: 13,
+      fontFamily: FONTES.marcaBold,
       fontWeight: '700',
       color: cores.textoSecundario,
       textTransform: 'uppercase',
-      marginTop: 12,
+      letterSpacing: 0.5,
+      marginTop: 16,
       marginBottom: 8,
     },
 
@@ -5421,45 +6074,52 @@ function criarEstilos(cores) {
       backgroundColor: cores.ambarFundo,
       borderWidth: 1,
       borderColor: cores.ambarBorda,
-      borderRadius: 14,
-      padding: 12,
-      marginBottom: 10,
+      borderRadius: 16,
+      padding: 16,
+      marginBottom: 8,
     },
-    pendingTitle: { fontSize: 14, fontWeight: '700', color: cores.ambarTextoForte },
-    pendingSubtitle: { fontSize: 12, color: cores.ambarTexto, marginTop: 2 },
+    pendingTitle: { fontSize: 14, fontFamily: FONTES.corpoBold, fontWeight: '700', color: cores.ambarTextoForte },
+    pendingSubtitle: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.ambarTexto, marginTop: 2 },
+    // Ação preenchida = marinho (verde-água no escuro), com texto por cima
+    // na cor que enxerga. Âmbar com texto branco não tinha contraste.
     pendingButton: {
-      backgroundColor: cores.ambar,
-      paddingHorizontal: 12,
+      backgroundColor: cores.primario,
+      paddingHorizontal: 16,
       paddingVertical: 8,
-      borderRadius: 10,
+      borderRadius: 12,
     },
-    pendingButtonText: { fontSize: 12, fontWeight: '700', color: cores.branco },
+    pendingButtonText: {
+      fontSize: 12,
+      fontFamily: FONTES.corpoBold,
+      fontWeight: '700',
+      color: cores.textoSobrePrimario,
+    },
 
     // Card de conta fixa cadastrada
     fixedBillCard: {
       flexDirection: 'row',
       alignItems: 'center',
       backgroundColor: cores.fundoCard,
-      borderRadius: 14,
-      padding: 14,
-      marginBottom: 10,
+      borderRadius: 16,
+      padding: 16,
+      marginBottom: 8,
       borderWidth: 1,
       borderColor: cores.borda,
     },
-    fixedBillTitle: { fontSize: 14, fontWeight: '600', color: cores.texto },
-    fixedBillSubtitle: { fontSize: 12, color: cores.textoSecundario, marginTop: 2 },
+    fixedBillTitle: { fontSize: 14, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.texto },
+    fixedBillSubtitle: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario, marginTop: 2 },
     // Botão grande de confirmar/desmarcar recebimento ou pagamento
     confirmToggleButton: {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',
-      paddingVertical: 10,
-      paddingHorizontal: 14,
+      paddingVertical: 12,
+      paddingHorizontal: 16,
       borderRadius: 12,
-      gap: 6,
+      gap: 8,
     },
     confirmToggleButtonPendente: {
-      backgroundColor: cores.laranjaForte,
+      backgroundColor: cores.primario,
     },
     confirmToggleButtonOk: {
       backgroundColor: cores.verdeFundoSuave,
@@ -5468,44 +6128,60 @@ function criarEstilos(cores) {
     },
     confirmToggleButtonText: {
       fontSize: 13,
+      fontFamily: FONTES.corpoBold,
       fontWeight: '700',
-      color: cores.branco,
+      color: cores.textoSobrePrimario,
     },
     confirmToggleButtonTextOk: {
       color: cores.verdeTextoForte,
     },
 
     // Segmented control (Menor Juros / Quita Rápido)
+    // Chapado: trilho com borda de 1px, e a opção ativa ganha o cartão
+    // branco + um sublinhado verde-água (forma preenchida, nunca texto).
+    // O trilho usa o fundo do app (e não "fundoSutil") de propósito: assim
+    // a opção ativa — que é um cartão "fundoCard" — fica sempre MAIS CLARA
+    // que o trilho nos dois temas. Com fundoSutil, no escuro a opção ativa
+    // ficava mais escura que o trilho e parecia afundada.
     segmentedControl: {
       flexDirection: 'row',
-      backgroundColor: cores.borda,
-      borderRadius: 12,
+      backgroundColor: cores.fundo,
+      borderWidth: 1,
+      borderColor: cores.borda,
+      borderRadius: 14,
       padding: 4,
-      marginBottom: 10,
+      marginBottom: 16,
     },
     segmentButton: {
       flex: 1,
-      paddingVertical: 10,
-      borderRadius: 9,
+      paddingVertical: 12,
+      borderRadius: 10,
       alignItems: 'center',
+      borderWidth: 1,
+      borderColor: 'transparent',
+      borderBottomWidth: 3,
+      borderBottomColor: 'transparent',
     },
     segmentButtonActive: {
       backgroundColor: cores.fundoCard,
-      shadowColor: cores.sombra,
-      shadowOffset: { width: 0, height: 1 },
-      shadowOpacity: 0.1,
-      shadowRadius: 2,
-      elevation: 2,
+      borderColor: cores.borda,
+      borderBottomWidth: 3,
+      borderBottomColor: cores.destaque,
     },
-    segmentButtonText: { fontSize: 13, fontWeight: '600', color: cores.textoSecundario },
-    segmentButtonTextActive: { color: cores.primario },
+    segmentButtonText: {
+      fontSize: 13,
+      fontFamily: FONTES.corpoSemi,
+      fontWeight: '600',
+      color: cores.textoSecundario,
+    },
+    segmentButtonTextActive: { color: cores.primario, fontFamily: FONTES.corpoBold, fontWeight: '700' },
 
     // Card de dívida
     debtCard: {
       backgroundColor: cores.fundoCard,
       borderRadius: 16,
       padding: 16,
-      marginBottom: 12,
+      marginBottom: 16,
       borderWidth: 1,
       borderColor: cores.borda,
     },
@@ -5520,48 +6196,58 @@ function criarEstilos(cores) {
     debtCardTopRow: {
       flexDirection: 'row',
       alignItems: 'center',
-      marginBottom: 10,
+      marginBottom: 8,
     },
     debtBadge: {
       width: 32,
       height: 32,
       borderRadius: 16,
-      backgroundColor: cores.primarioFundo,
+      backgroundColor: cores.fundoSutil,
       alignItems: 'center',
       justifyContent: 'center',
-      marginRight: 10,
+      marginRight: 12,
     },
-    debtBadgeText: { fontSize: 13, fontWeight: '700', color: cores.primario },
-    debtName: { fontSize: 15, fontWeight: '700', color: cores.texto },
-    debtFocoLabel: { fontSize: 12, color: cores.primario, fontWeight: '600', marginTop: 2 },
+    debtBadgeText: { fontSize: 13, fontFamily: FONTES.corpoBold, fontWeight: '700', color: cores.primario },
+    debtName: { fontSize: 15, fontFamily: FONTES.corpoBold, fontWeight: '700', color: cores.texto },
+    debtFocoLabel: {
+      fontSize: 12,
+      fontFamily: FONTES.corpoSemi,
+      color: cores.primario,
+      fontWeight: '600',
+      marginTop: 2,
+    },
     debtInfoRow: {
       flexDirection: 'row',
       justifyContent: 'space-between',
-      marginTop: 4,
+      marginTop: 8,
     },
-    debtInfoLabel: { fontSize: 13, color: cores.textoSecundario },
-    debtInfoValue: { fontSize: 13, fontWeight: '600', color: cores.textoLabel },
-    debtStatusMesTexto: { fontSize: 12, color: cores.textoSecundario, marginTop: 8 },
+    debtInfoLabel: { fontSize: 13, fontFamily: FONTES.corpo, color: cores.textoSecundario },
+    debtInfoValue: { fontSize: 13, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.textoLabel },
+    debtStatusMesTexto: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario, marginTop: 16 },
     debtWarningBox: {
       flexDirection: 'row',
       alignItems: 'center',
       backgroundColor: cores.ambarFundo,
-      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: cores.ambarBorda,
+      borderRadius: 12,
       padding: 8,
-      marginTop: 10,
-      gap: 6,
+      marginTop: 16,
+      gap: 8,
     },
-    debtWarningText: { flex: 1, fontSize: 12, color: cores.ambarTextoForte },
+    debtWarningText: { flex: 1, fontSize: 12, fontFamily: FONTES.corpo, color: cores.ambarTextoForte },
     avisoOrdemIgualBox: {
       flexDirection: 'row',
       alignItems: 'center',
       backgroundColor: cores.ambarFundo,
-      borderRadius: 10,
-      padding: 10,
-      marginTop: 10,
+      borderWidth: 1,
+      borderColor: cores.ambarBorda,
+      borderRadius: 12,
+      padding: 16,
+      marginTop: 8,
       gap: 8,
     },
-    avisoOrdemIgualTexto: { flex: 1, fontSize: 12, color: cores.ambarTextoForte },
+    avisoOrdemIgualTexto: { flex: 1, fontSize: 12, fontFamily: FONTES.corpo, color: cores.ambarTextoForte },
 
     addButton: {
       flexDirection: 'row',
@@ -5570,34 +6256,36 @@ function criarEstilos(cores) {
       borderWidth: 1,
       borderColor: cores.primarioFundoBorda,
       borderStyle: 'dashed',
-      borderRadius: 14,
-      paddingVertical: 14,
+      borderRadius: 16,
+      paddingVertical: 16,
       marginBottom: 24,
       gap: 8,
     },
-    addButtonText: { fontSize: 14, fontWeight: '600', color: cores.primario },
+    addButtonText: { fontSize: 14, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.primario },
 
     input: {
-      backgroundColor: cores.fundoCard,
+      backgroundColor: cores.fundoSutil,
       borderWidth: 1,
       borderColor: cores.borda,
       borderRadius: 12,
-      paddingHorizontal: 14,
+      paddingHorizontal: 16,
       paddingVertical: 12,
       fontSize: 14,
+      fontFamily: FONTES.corpo,
       color: cores.texto,
-      marginBottom: 14,
+      marginBottom: 16,
     },
     inputLabel: {
       fontSize: 13,
+      fontFamily: FONTES.corpoSemi,
       fontWeight: '600',
       color: cores.textoLabel,
-      marginBottom: 6,
+      marginBottom: 8,
     },
 
     comparisonRow: {
       flexDirection: 'row',
-      gap: 12,
+      gap: 16,
       marginBottom: 8,
     },
     comparisonCard: {
@@ -5618,23 +6306,44 @@ function criarEstilos(cores) {
       borderWidth: 2,
       backgroundColor: cores.primarioFundo,
     },
+    // Selinho pequeno preenchido de verde-água, com texto marinho por cima
+    // (marinho nos DOIS temas — é a única leitura acessível sobre #00C4B4).
     comparisonSelecionadaBadge: {
+      alignSelf: 'flex-start',
       fontSize: 11,
+      fontFamily: FONTES.corpoBold,
       fontWeight: '700',
-      color: cores.primario,
-      marginBottom: 4,
+      color: MARINHO_DA_MARCA,
+      backgroundColor: cores.destaque,
+      paddingHorizontal: 8,
+      paddingVertical: 2,
+      borderRadius: 6,
+      overflow: 'hidden',
+      marginBottom: 8,
     },
-    comparisonTitle: { fontSize: 13, fontWeight: '700', color: cores.texto, marginBottom: 6 },
-    comparisonValue: { fontSize: 18, fontWeight: '700', color: cores.texto },
-    comparisonSubtitle: { fontSize: 12, color: cores.textoSecundario, marginTop: 4 },
-    comparisonBadge: { fontSize: 12, fontWeight: '700', color: cores.verdeTextoForte, marginTop: 8 },
+    comparisonTitle: {
+      fontSize: 13,
+      fontFamily: FONTES.corpoBold,
+      fontWeight: '700',
+      color: cores.texto,
+      marginBottom: 8,
+    },
+    comparisonValue: { fontSize: 18, fontFamily: FONTES.marcaBold, fontWeight: '700', color: cores.texto },
+    comparisonSubtitle: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario, marginTop: 8 },
+    comparisonBadge: {
+      fontSize: 12,
+      fontFamily: FONTES.corpoBold,
+      fontWeight: '700',
+      color: cores.verdeTextoForte,
+      marginTop: 8,
+    },
 
     // Aba Investimentos — card de cada investimento
     investCard: {
       backgroundColor: cores.fundoCard,
       borderRadius: 16,
       padding: 16,
-      marginBottom: 12,
+      marginBottom: 16,
       borderWidth: 1,
       borderColor: cores.borda,
     },
@@ -5642,26 +6351,26 @@ function criarEstilos(cores) {
       flexDirection: 'row',
       alignItems: 'flex-start',
       justifyContent: 'space-between',
-      marginBottom: 10,
+      marginBottom: 8,
     },
-    investName: { fontSize: 15, fontWeight: '700', color: cores.texto, marginBottom: 6 },
+    investName: { fontSize: 15, fontFamily: FONTES.corpoBold, fontWeight: '700', color: cores.texto, marginBottom: 8 },
     investTipoBadge: {
       alignSelf: 'flex-start',
       borderWidth: 1,
       borderRadius: 8,
       paddingHorizontal: 8,
-      paddingVertical: 3,
+      paddingVertical: 4,
     },
-    investTipoBadgeText: { fontSize: 11, fontWeight: '700' },
+    investTipoBadgeText: { fontSize: 11, fontFamily: FONTES.corpoBold, fontWeight: '700' },
 
     // Barra de alocação por tipo (empilhada) e legenda embaixo dela
     allocationBarContainer: {
       flexDirection: 'row',
-      height: 14,
+      height: 16,
       borderRadius: 8,
       overflow: 'hidden',
       backgroundColor: cores.fundoSutil,
-      marginBottom: 12,
+      marginBottom: 16,
     },
     allocationLegendRow: {
       flexDirection: 'row',
@@ -5674,32 +6383,42 @@ function criarEstilos(cores) {
       borderRadius: 5,
       marginRight: 8,
     },
-    allocationLegendText: { flex: 1, fontSize: 13, color: cores.textoLabel },
-    allocationLegendPercent: { fontSize: 13, fontWeight: '600', color: cores.texto },
+    allocationLegendText: { flex: 1, fontSize: 13, fontFamily: FONTES.corpo, color: cores.textoLabel },
+    allocationLegendPercent: { fontSize: 13, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.texto },
 
     // Card da meta de reserva de emergência
     reserveCard: {
       backgroundColor: cores.fundoCard,
       borderRadius: 16,
       padding: 16,
-      marginBottom: 12,
+      marginBottom: 16,
       borderWidth: 1,
       borderColor: cores.borda,
     },
-    reserveValueText: { fontSize: 17, fontWeight: '700', color: cores.texto, marginBottom: 10 },
+    reserveValueText: {
+      fontSize: 17,
+      fontFamily: FONTES.marcaBold,
+      fontWeight: '700',
+      color: cores.texto,
+      marginBottom: 16,
+    },
     reserveProgressTrack: {
       height: 12,
       borderRadius: 6,
       backgroundColor: cores.fundoSutil,
       overflow: 'hidden',
-      marginBottom: 6,
+      marginBottom: 8,
     },
+    // A "ponta" da barra é um marcador verde-água preenchido — é assim que
+    // a marca usa o acento (forma cheia, nunca texto nem traço fino).
     reserveProgressFill: {
       height: 12,
       borderRadius: 6,
       backgroundColor: cores.primario,
+      borderRightWidth: 4,
+      borderRightColor: cores.destaque,
     },
-    reserveProgressLabel: { fontSize: 12, color: cores.textoSecundario },
+    reserveProgressLabel: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario },
 
     // Chips (seletor de tipo de investimento, seletor de dívida no comparador)
     chipRow: {
@@ -5716,20 +6435,22 @@ function criarEstilos(cores) {
       borderWidth: 1,
       borderColor: cores.borda,
     },
+    // Chip selecionado = pílula preenchida na cor de ação, texto por cima
+    // na cor que enxerga (branco no claro, marinho no escuro).
     chipActive: {
-      backgroundColor: cores.primarioFundo,
+      backgroundColor: cores.primario,
       borderColor: cores.primario,
     },
-    chipText: { fontSize: 13, color: cores.textoSecundario, fontWeight: '600' },
-    chipTextActive: { color: cores.primario },
+    chipText: { fontSize: 13, fontFamily: FONTES.corpoSemi, color: cores.textoSecundario, fontWeight: '600' },
+    chipTextActive: { color: cores.textoSobrePrimario },
 
     // Resultado do comparador "investir ou quitar dívida?"
     comparadorResultBox: {
-      borderRadius: 14,
-      padding: 14,
+      borderRadius: 16,
+      padding: 16,
       borderWidth: 1,
-      marginBottom: 14,
-      gap: 4,
+      marginBottom: 16,
+      gap: 8,
     },
     comparadorResultBoxQuitar: {
       backgroundColor: cores.ambarFundo,
@@ -5739,27 +6460,33 @@ function criarEstilos(cores) {
       backgroundColor: cores.verdeFundo,
       borderColor: cores.verdeBorda,
     },
-    comparadorResultTitle: { fontSize: 14, fontWeight: '700' },
-    comparadorResultText: { fontSize: 12, lineHeight: 17 },
+    comparadorResultTitle: { fontSize: 14, fontFamily: FONTES.corpoBold, fontWeight: '700' },
+    comparadorResultText: { fontSize: 12, fontFamily: FONTES.corpo, lineHeight: 18 },
 
     // Simulador de futuro/aposentadoria (aba Investimentos)
     simuladorFuturoCard: {
       flex: 1,
       borderRadius: 12,
-      padding: 12,
+      padding: 16,
       borderWidth: 1,
       backgroundColor: cores.primarioFundo,
       borderColor: cores.primarioFundoBorda,
     },
-    simuladorFuturoLabel: { fontSize: 12, color: cores.textoSecundario },
-    simuladorFuturoValor: { fontSize: 16, fontWeight: '700', color: cores.texto, marginTop: 4 },
+    simuladorFuturoLabel: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario },
+    simuladorFuturoValor: {
+      fontSize: 16,
+      fontFamily: FONTES.marcaBold,
+      fontWeight: '700',
+      color: cores.texto,
+      marginTop: 8,
+    },
 
     // Metas de economia (aba Investimentos)
     metaCard: {
       backgroundColor: cores.fundoCard,
       borderRadius: 16,
       padding: 16,
-      marginBottom: 12,
+      marginBottom: 16,
       borderWidth: 1,
       borderColor: cores.borda,
     },
@@ -5769,26 +6496,41 @@ function criarEstilos(cores) {
       justifyContent: 'space-between',
       marginBottom: 8,
     },
-    metaName: { fontSize: 15, fontWeight: '700', color: cores.texto, flex: 1, marginRight: 8 },
-    metaValorText: { fontSize: 14, fontWeight: '600', color: cores.textoLabel, marginBottom: 8 },
+    metaName: {
+      fontSize: 15,
+      fontFamily: FONTES.corpoBold,
+      fontWeight: '700',
+      color: cores.texto,
+      flex: 1,
+      marginRight: 8,
+    },
+    metaValorText: {
+      fontSize: 14,
+      fontFamily: FONTES.corpoSemi,
+      fontWeight: '600',
+      color: cores.textoLabel,
+      marginBottom: 8,
+    },
     metaProgressTrack: {
       height: 12,
       borderRadius: 6,
       backgroundColor: cores.fundoSutil,
       overflow: 'hidden',
-      marginBottom: 6,
+      marginBottom: 8,
     },
     metaProgressFill: {
       height: 12,
       borderRadius: 6,
       backgroundColor: cores.primario,
+      borderRightWidth: 4,
+      borderRightColor: cores.destaque,
     },
     metaProgressFillCompleta: {
       backgroundColor: cores.verde,
     },
-    metaProgressLabel: { fontSize: 12, color: cores.textoSecundario, marginBottom: 6 },
-    metaAtingidaTexto: { fontSize: 13, fontWeight: '700', color: cores.verdeTextoForte },
-    metaSugestaoTexto: { fontSize: 12, color: cores.textoSecundario, lineHeight: 17 },
+    metaProgressLabel: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario, marginBottom: 8 },
+    metaAtingidaTexto: { fontSize: 13, fontFamily: FONTES.corpoBold, fontWeight: '700', color: cores.verdeTextoForte },
+    metaSugestaoTexto: { fontSize: 12, fontFamily: FONTES.corpo, color: cores.textoSecundario, lineHeight: 18 },
 
     // Modal de nova dívida
     modalOverlay: {
@@ -5798,13 +6540,16 @@ function criarEstilos(cores) {
     },
     modalContent: {
       backgroundColor: cores.fundoCard,
-      borderTopLeftRadius: 24,
-      borderTopRightRadius: 24,
+      borderTopLeftRadius: 20,
+      borderTopRightRadius: 20,
+      borderTopWidth: 1,
+      borderColor: cores.borda,
       padding: 24,
       paddingBottom: 32,
     },
     modalTitle: {
       fontSize: 18,
+      fontFamily: FONTES.marcaBold,
       fontWeight: '700',
       color: cores.texto,
       marginBottom: 16,
@@ -5822,20 +6567,27 @@ function criarEstilos(cores) {
     },
     modalCancelButton: {
       flex: 1,
-      paddingVertical: 14,
-      borderRadius: 12,
+      paddingVertical: 16,
+      borderRadius: 14,
       alignItems: 'center',
       backgroundColor: cores.fundoSutil,
+      borderWidth: 1,
+      borderColor: cores.borda,
     },
-    modalCancelButtonText: { fontSize: 14, fontWeight: '600', color: cores.textoLabel },
+    modalCancelButtonText: { fontSize: 14, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.textoLabel },
     modalConfirmButton: {
       flex: 1,
-      paddingVertical: 14,
-      borderRadius: 12,
+      paddingVertical: 16,
+      borderRadius: 14,
       alignItems: 'center',
       backgroundColor: cores.primario,
     },
-    modalConfirmButtonText: { fontSize: 14, fontWeight: '600', color: cores.branco },
+    modalConfirmButtonText: {
+      fontSize: 14,
+      fontFamily: FONTES.corpoSemi,
+      fontWeight: '600',
+      color: cores.textoSobrePrimario,
+    },
 
     // Botão de "Sair" (logout), no modal de configurações
     logoutButton: {
@@ -5843,14 +6595,47 @@ function criarEstilos(cores) {
       alignItems: 'center',
       justifyContent: 'center',
       gap: 8,
-      paddingVertical: 14,
-      borderRadius: 12,
+      paddingVertical: 16,
+      borderRadius: 14,
       backgroundColor: cores.vermelhoFundo,
       borderWidth: 1,
       borderColor: cores.vermelhoBorda,
       marginBottom: 16,
     },
-    logoutButtonText: { fontSize: 14, fontWeight: '600', color: cores.vermelhoTextoForte },
+    logoutButtonText: { fontSize: 14, fontFamily: FONTES.corpoSemi, fontWeight: '600', color: cores.vermelhoTextoForte },
+
+    // Faixa fina de sincronização (fica logo acima da barra de abas, então
+    // nunca cobre nada — ela empurra o conteúdo de leve e só isso).
+    // Chapada, borda de 1px, sem sombra: mesmo desenho dos outros avisos.
+    syncBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      borderTopWidth: 1,
+      borderBottomWidth: 1,
+    },
+    syncBannerPendente: {
+      backgroundColor: cores.ambarFundo,
+      borderTopColor: cores.ambarBorda,
+      borderBottomColor: cores.ambarBorda,
+    },
+    syncBannerOffline: {
+      backgroundColor: cores.fundoSutil,
+      borderTopColor: cores.borda,
+      borderBottomColor: cores.borda,
+    },
+    // Pontinho verde-água da marca — forma preenchida, nunca texto.
+    syncBannerPonto: {
+      width: 8,
+      height: 8,
+      borderRadius: 4,
+      marginHorizontal: 5,
+      backgroundColor: cores.destaque,
+    },
+    syncBannerTitulo: { fontSize: 13, fontFamily: FONTES.corpoSemi, fontWeight: '600' },
+    syncBannerTexto: { fontSize: 12, fontFamily: FONTES.corpo, marginTop: 2, lineHeight: 16 },
 
     // Barra de abas (feita na mão, sem biblioteca)
     tabBar: {
@@ -5865,10 +6650,24 @@ function criarEstilos(cores) {
     tabButton: {
       flex: 1,
       alignItems: 'center',
-      gap: 2,
+      gap: 4,
     },
-    tabLabel: { fontSize: 10, color: cores.textoMuted, fontWeight: '600' },
-    tabLabelActive: { color: cores.primario },
+    tabLabel: { fontSize: 11, fontFamily: FONTES.corpoSemi, color: cores.textoMuted, fontWeight: '600' },
+    tabLabelActive: { color: cores.primario, fontFamily: FONTES.corpoBold, fontWeight: '700' },
+    // Pontinho verde-água embaixo da aba ativa. O "espaço" tem o mesmo
+    // tamanho, invisível, pra todas as abas ficarem na mesma altura.
+    tabDotEspaco: {
+      width: 6,
+      height: 6,
+      marginTop: 2,
+    },
+    tabDotAtivo: {
+      width: 6,
+      height: 6,
+      borderRadius: 3,
+      marginTop: 2,
+      backgroundColor: cores.destaque,
+    },
   });
 }
 
