@@ -26,6 +26,7 @@ import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import { supabase } from './lib/supabase';
 
 // ============================================================
 // FUNÇÕES AUXILIARES (usadas em várias partes do app)
@@ -365,13 +366,226 @@ function agruparTransacoesPorMes(transacoes, t) {
 // ABA 1: INÍCIO — resumo financeiro simples
 // ============================================================
 
-// Chaves usadas pra guardar os dados no armazenamento do celular.
-const CHAVE_ARMAZENAMENTO_TRANSACOES = '@meu-financeiro:transacoes';
-const CHAVE_ARMAZENAMENTO_CONTAS_FIXAS = '@meu-financeiro:contasFixas';
-const CHAVE_ARMAZENAMENTO_DIVIDAS = '@meu-financeiro:dividas';
-const CHAVE_ARMAZENAMENTO_STREAK = '@meu-financeiro:streak';
-const CHAVE_ARMAZENAMENTO_INVESTIMENTOS = '@meu-financeiro:investimentos';
-const CHAVE_ARMAZENAMENTO_METAS = '@meu-financeiro:metas';
+// ============================================================
+// SUPABASE — sincronização por usuário (substitui o antigo AsyncStorage
+// pra esses 6 "domínios" financeiros: cada pessoa só lê/grava as próprias
+// linhas, graças ao RLS já configurado em supabase-schema.sql). Tema e
+// idioma continuam guardados só no aparelho — ver CHAVE_ARMAZENAMENTO_TEMA
+// e CHAVE_ARMAZENAMENTO_IDIOMA lá embaixo, essas duas não mudam.
+// ============================================================
+
+// Nomes das tabelas no Postgres (iguais aos de supabase-schema.sql)
+const TABELA_TRANSACOES = 'transacoes';
+const TABELA_CONTAS_FIXAS = 'contas_fixas';
+const TABELA_DIVIDAS = 'dividas';
+const TABELA_STREAK = 'streak';
+const TABELA_INVESTIMENTOS = 'investimentos';
+const TABELA_METAS = 'metas';
+
+// Busca todas as linhas de uma tabela pertencentes a esse usuário e já
+// converte cada uma de snake_case (formato do banco) pra camelCase
+// (formato usado no resto do app), usando o conversor passado.
+async function buscarLinhasDoUsuario(tabela, userId, linhaParaObjeto) {
+  const { data, error } = await supabase.from(tabela).select('*').eq('user_id', userId);
+  if (error) throw error;
+  return (data || []).map(linhaParaObjeto);
+}
+
+// "Salva" uma lista inteira (array de objetos em camelCase) numa tabela:
+// grava/atualiza (upsert) cada item, e apaga do banco qualquer linha
+// desse usuário que não esteja mais na lista (por exemplo, depois de
+// remover uma transação ou uma dívida). Como esse app é de uso pessoal
+// (dezenas/poucas centenas de linhas), fazer upsert + apagar as que
+// sobraram é simples e rápido o suficiente, sem precisar controlar cada
+// alteração individualmente.
+async function sincronizarLinhasDoUsuario(tabela, userId, itens, objetoParaLinha) {
+  if (itens.length > 0) {
+    const linhas = itens.map((item) => objetoParaLinha(item, userId));
+    const { error: erroUpsert } = await supabase.from(tabela).upsert(linhas, { onConflict: 'id' });
+    if (erroUpsert) throw erroUpsert;
+  }
+
+  const { data: linhasExistentes, error: erroSelect } = await supabase
+    .from(tabela)
+    .select('id')
+    .eq('user_id', userId);
+  if (erroSelect) throw erroSelect;
+
+  const idsAtuais = new Set(itens.map((item) => item.id));
+  const idsParaApagar = (linhasExistentes || [])
+    .map((linha) => linha.id)
+    .filter((id) => !idsAtuais.has(id));
+
+  if (idsParaApagar.length > 0) {
+    const { error: erroDelete } = await supabase
+      .from(tabela)
+      .delete()
+      .eq('user_id', userId)
+      .in('id', idsParaApagar);
+    if (erroDelete) throw erroDelete;
+  }
+}
+
+// ---------- Conversores de campos: transações ----------
+function transacaoParaLinha(transacao, userId) {
+  return {
+    id: transacao.id,
+    user_id: userId,
+    titulo: transacao.titulo,
+    valor: transacao.valor,
+    tipo: transacao.tipo,
+    data_iso: transacao.dataISO,
+    compra_parcelada_id: transacao.compraParceladaId || null,
+  };
+}
+function linhaParaTransacao(linha) {
+  const dataISO = linha.data_iso;
+  return {
+    id: linha.id,
+    titulo: linha.titulo,
+    valor: Number(linha.valor),
+    tipo: linha.tipo,
+    // "data" (DD/MM/AAAA) não é salva no banco — reconstruída aqui a
+    // partir de "dataISO" pra continuar aparecendo igual na tela.
+    data: dataParaBR(dataISOParaData(dataISO)),
+    dataISO,
+    compraParceladaId: linha.compra_parcelada_id || null,
+  };
+}
+
+// ---------- Conversores de campos: contas fixas ----------
+function contaFixaParaLinha(contaFixa, userId) {
+  return {
+    id: contaFixa.id,
+    user_id: userId,
+    titulo: contaFixa.titulo,
+    valor: contaFixa.valor,
+    tipo: contaFixa.tipo,
+    dia_do_mes: contaFixa.diaDoMes,
+    ultimo_mes_confirmado: contaFixa.ultimoMesConfirmado || null,
+    transacao_confirmada_id: contaFixa.transacaoConfirmadaId || null,
+  };
+}
+function linhaParaContaFixa(linha) {
+  return {
+    id: linha.id,
+    titulo: linha.titulo,
+    valor: Number(linha.valor),
+    tipo: linha.tipo,
+    diaDoMes: linha.dia_do_mes,
+    ultimoMesConfirmado: linha.ultimo_mes_confirmado || null,
+    transacaoConfirmadaId: linha.transacao_confirmada_id || null,
+  };
+}
+
+// ---------- Conversores de campos: dívidas ----------
+function dividaParaLinha(divida, userId) {
+  return {
+    id: divida.id,
+    user_id: userId,
+    nome: divida.nome,
+    saldo_devedor: divida.saldoDevedor,
+    taxa_juros_mensal: divida.taxaJurosMensal,
+    parcela_minima: divida.parcelaMinima,
+    numero_parcelas: divida.numeroParcelas || null,
+    parcelas_pagas: divida.parcelasPagas || 0,
+    ultimo_mes_confirmado: divida.ultimoMesConfirmado || null,
+    transacao_confirmada_id: divida.transacaoConfirmadaId || null,
+    saldo_antes_ultima_parcela:
+      divida.saldoAntesUltimaParcela === null || divida.saldoAntesUltimaParcela === undefined
+        ? null
+        : divida.saldoAntesUltimaParcela,
+  };
+}
+function linhaParaDivida(linha) {
+  return comCamposDivida({
+    id: linha.id,
+    nome: linha.nome,
+    saldoDevedor: Number(linha.saldo_devedor),
+    taxaJurosMensal: Number(linha.taxa_juros_mensal),
+    parcelaMinima: Number(linha.parcela_minima),
+    numeroParcelas: linha.numero_parcelas || 0,
+    parcelasPagas: linha.parcelas_pagas || 0,
+    ultimoMesConfirmado: linha.ultimo_mes_confirmado || null,
+    transacaoConfirmadaId: linha.transacao_confirmada_id || null,
+    saldoAntesUltimaParcela:
+      linha.saldo_antes_ultima_parcela === null || linha.saldo_antes_ultima_parcela === undefined
+        ? null
+        : Number(linha.saldo_antes_ultima_parcela),
+  });
+}
+
+// ---------- Conversores de campos: investimentos ----------
+function investimentoParaLinha(investimento, userId) {
+  return {
+    id: investimento.id,
+    user_id: userId,
+    nome: investimento.nome,
+    tipo: investimento.tipo,
+    valor_investido: investimento.valorInvestido,
+    valor_atual: investimento.valorAtual,
+  };
+}
+function linhaParaInvestimento(linha) {
+  return {
+    id: linha.id,
+    nome: linha.nome,
+    tipo: linha.tipo,
+    valorInvestido: Number(linha.valor_investido),
+    valorAtual: Number(linha.valor_atual),
+  };
+}
+
+// ---------- Conversores de campos: metas de economia ----------
+function metaParaLinha(meta, userId) {
+  return {
+    id: meta.id,
+    user_id: userId,
+    nome: meta.nome,
+    valor_alvo: meta.valorAlvo,
+    valor_atual: meta.valorAtual,
+    data_alvo: meta.dataAlvo || null,
+  };
+}
+function linhaParaMeta(linha) {
+  return {
+    id: linha.id,
+    nome: linha.nome,
+    valorAlvo: Number(linha.valor_alvo),
+    valorAtual: Number(linha.valor_atual),
+    dataAlvo: linha.data_alvo || null,
+  };
+}
+
+// ---------- Sequência ("streak") — uma linha só por usuário ----------
+async function buscarStreakDoUsuario(userId) {
+  const { data, error } = await supabase
+    .from(TABELA_STREAK)
+    .select('*')
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  return {
+    streakAtual: data.streak_atual,
+    melhorStreak: data.melhor_streak,
+    diaRegistrado: data.dia_registrado,
+    statusMaisRecente: data.status_mais_recente,
+  };
+}
+async function salvarStreakDoUsuario(userId, streakData) {
+  const { error } = await supabase.from(TABELA_STREAK).upsert(
+    {
+      user_id: userId,
+      streak_atual: streakData.streakAtual,
+      melhor_streak: streakData.melhorStreak,
+      dia_registrado: streakData.diaRegistrado,
+      status_mais_recente: streakData.statusMaisRecente,
+    },
+    { onConflict: 'user_id' }
+  );
+  if (error) throw error;
+}
 
 // Volta um dia a partir de uma data "AAAA-MM-DD" (cuida sozinho da virada
 // de mês/ano, por causa de como o objeto Date funciona).
@@ -480,6 +694,8 @@ function calcularAlertaMesEstranho(transacoesJaOcorridas, mesAtualChave, diaDeHo
 function TelaInicio() {
   const { estilos: styles, cores } = useTema();
   const { t } = useIdioma();
+  const { user } = useAuth();
+  const userId = user.id;
   const [transacoes, setTransacoes] = useState([]);
   const [carregandoTransacoes, setCarregandoTransacoes] = useState(true);
   const [modalVisivel, setModalVisivel] = useState(false);
@@ -533,16 +749,13 @@ function TelaInicio() {
   const [dividas, setDividas] = useState([]);
   const [carregandoDividas, setCarregandoDividas] = useState(true);
 
-  // Carrega as transações salvas assim que a tela abre
+  // Carrega as transações salvas (no Supabase, só as desse usuário) assim
+  // que a tela abre
   useEffect(() => {
     async function carregarTransacoesSalvas() {
       try {
-        const dadosSalvos = await AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_TRANSACOES);
-        if (dadosSalvos !== null) {
-          // "comDataISO" preenche o campo novo (dataISO) em transações
-          // salvas antes dessa atualização existir
-          setTransacoes(JSON.parse(dadosSalvos).map(comDataISO));
-        }
+        const transacoesCarregadas = await buscarLinhasDoUsuario(TABELA_TRANSACOES, userId, linhaParaTransacao);
+        setTransacoes(transacoesCarregadas.map(comDataISO));
       } catch (erro) {
         console.log('Não foi possível carregar as transações salvas:', erro);
       } finally {
@@ -550,24 +763,22 @@ function TelaInicio() {
       }
     }
     carregarTransacoesSalvas();
-  }, []);
+  }, [userId]);
 
   // Salva de novo toda vez que a lista de transações mudar
   useEffect(() => {
     if (carregandoTransacoes) return;
-    AsyncStorage.setItem(CHAVE_ARMAZENAMENTO_TRANSACOES, JSON.stringify(transacoes)).catch((erro) => {
+    sincronizarLinhasDoUsuario(TABELA_TRANSACOES, userId, transacoes, transacaoParaLinha).catch((erro) => {
       console.log('Não foi possível salvar as transações:', erro);
     });
-  }, [transacoes, carregandoTransacoes]);
+  }, [transacoes, carregandoTransacoes, userId]);
 
   // Carrega as contas fixas salvas
   useEffect(() => {
     async function carregarContasFixasSalvas() {
       try {
-        const dadosSalvos = await AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_CONTAS_FIXAS);
-        if (dadosSalvos !== null) {
-          setContasFixas(JSON.parse(dadosSalvos));
-        }
+        const contasCarregadas = await buscarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, linhaParaContaFixa);
+        setContasFixas(contasCarregadas);
       } catch (erro) {
         console.log('Não foi possível carregar as contas fixas salvas:', erro);
       } finally {
@@ -575,24 +786,22 @@ function TelaInicio() {
       }
     }
     carregarContasFixasSalvas();
-  }, []);
+  }, [userId]);
 
   // Salva de novo toda vez que a lista de contas fixas mudar
   useEffect(() => {
     if (carregandoContasFixas) return;
-    AsyncStorage.setItem(CHAVE_ARMAZENAMENTO_CONTAS_FIXAS, JSON.stringify(contasFixas)).catch((erro) => {
+    sincronizarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, contasFixas, contaFixaParaLinha).catch((erro) => {
       console.log('Não foi possível salvar as contas fixas:', erro);
     });
-  }, [contasFixas, carregandoContasFixas]);
+  }, [contasFixas, carregandoContasFixas, userId]);
 
-  // Carrega as dívidas salvas (a mesma "gaveta" que a aba Dívidas usa)
+  // Carrega as dívidas salvas (a mesma tabela que a aba Dívidas usa)
   useEffect(() => {
     async function carregarDividasSalvas() {
       try {
-        const dadosSalvos = await AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_DIVIDAS);
-        if (dadosSalvos !== null) {
-          setDividas(JSON.parse(dadosSalvos).map(comCamposDivida));
-        }
+        const dividasCarregadas = await buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida);
+        setDividas(dividasCarregadas);
       } catch (erro) {
         console.log('Não foi possível carregar as dívidas salvas:', erro);
       } finally {
@@ -600,25 +809,25 @@ function TelaInicio() {
       }
     }
     carregarDividasSalvas();
-  }, []);
+  }, [userId]);
 
   // Salva de novo toda vez que a lista de dívidas mudar (por causa da
   // confirmação de parcela, feita aqui na tela de Início)
   useEffect(() => {
     if (carregandoDividas) return;
-    AsyncStorage.setItem(CHAVE_ARMAZENAMENTO_DIVIDAS, JSON.stringify(dividas)).catch((erro) => {
+    sincronizarLinhasDoUsuario(TABELA_DIVIDAS, userId, dividas, dividaParaLinha).catch((erro) => {
       console.log('Não foi possível salvar as dívidas:', erro);
     });
-  }, [dividas, carregandoDividas]);
+  }, [dividas, carregandoDividas, userId]);
 
   // Carrega a sequência salva (a lógica que atualiza ela mesma fica lá
   // embaixo, depois que o status do semáforo de hoje já foi calculado)
   useEffect(() => {
     async function carregarStreakSalva() {
       try {
-        const dadosSalvos = await AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_STREAK);
-        if (dadosSalvos !== null) {
-          setStreakData(JSON.parse(dadosSalvos));
+        const streakCarregada = await buscarStreakDoUsuario(userId);
+        if (streakCarregada !== null) {
+          setStreakData(streakCarregada);
         }
       } catch (erro) {
         console.log('Não foi possível carregar a sequência salva:', erro);
@@ -627,7 +836,7 @@ function TelaInicio() {
       }
     }
     carregarStreakSalva();
-  }, []);
+  }, [userId]);
 
   // Os totais são calculados de verdade, a partir de TODAS as transações
   // (o Saldo Total é o acumulado geral, não só do mês)
@@ -759,10 +968,10 @@ function TelaInicio() {
   // Salva a sequência sempre que ela mudar
   useEffect(() => {
     if (carregandoStreak) return;
-    AsyncStorage.setItem(CHAVE_ARMAZENAMENTO_STREAK, JSON.stringify(streakData)).catch((erro) => {
+    salvarStreakDoUsuario(userId, streakData).catch((erro) => {
       console.log('Não foi possível salvar a sequência:', erro);
     });
-  }, [streakData, carregandoStreak]);
+  }, [streakData, carregandoStreak, userId]);
 
   // ---- "Alerta de mês estranho" ----
   const alertaMesEstranho = calcularAlertaMesEstranho(transacoesJaOcorridas, mesAtualChave, diaDeHoje);
@@ -2103,6 +2312,8 @@ function CardMeta({ meta, onRemover, onEditar }) {
 function TelaInvestimentos() {
   const { estilos: styles, cores } = useTema();
   const { t } = useIdioma();
+  const { user } = useAuth();
+  const userId = user.id;
   const [investimentos, setInvestimentos] = useState([]);
   const [carregandoInvestimentos, setCarregandoInvestimentos] = useState(true);
   const [modalVisivel, setModalVisivel] = useState(false);
@@ -2143,10 +2354,12 @@ function TelaInvestimentos() {
   useEffect(() => {
     async function carregarInvestimentosSalvos() {
       try {
-        const dadosSalvos = await AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_INVESTIMENTOS);
-        if (dadosSalvos !== null) {
-          setInvestimentos(JSON.parse(dadosSalvos));
-        }
+        const investimentosCarregados = await buscarLinhasDoUsuario(
+          TABELA_INVESTIMENTOS,
+          userId,
+          linhaParaInvestimento
+        );
+        setInvestimentos(investimentosCarregados);
       } catch (erro) {
         console.log('Não foi possível carregar os investimentos salvos:', erro);
       } finally {
@@ -2154,22 +2367,20 @@ function TelaInvestimentos() {
       }
     }
     carregarInvestimentosSalvos();
-  }, []);
+  }, [userId]);
 
   useEffect(() => {
     if (carregandoInvestimentos) return;
-    AsyncStorage.setItem(CHAVE_ARMAZENAMENTO_INVESTIMENTOS, JSON.stringify(investimentos)).catch((erro) => {
+    sincronizarLinhasDoUsuario(TABELA_INVESTIMENTOS, userId, investimentos, investimentoParaLinha).catch((erro) => {
       console.log('Não foi possível salvar os investimentos:', erro);
     });
-  }, [investimentos, carregandoInvestimentos]);
+  }, [investimentos, carregandoInvestimentos, userId]);
 
   useEffect(() => {
     async function carregarMetasSalvas() {
       try {
-        const dadosSalvos = await AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_METAS);
-        if (dadosSalvos !== null) {
-          setMetas(JSON.parse(dadosSalvos));
-        }
+        const metasCarregadas = await buscarLinhasDoUsuario(TABELA_METAS, userId, linhaParaMeta);
+        setMetas(metasCarregadas);
       } catch (erro) {
         console.log('Não foi possível carregar as metas salvas:', erro);
       } finally {
@@ -2177,27 +2388,28 @@ function TelaInvestimentos() {
       }
     }
     carregarMetasSalvas();
-  }, []);
+  }, [userId]);
 
   useEffect(() => {
     if (carregandoMetas) return;
-    AsyncStorage.setItem(CHAVE_ARMAZENAMENTO_METAS, JSON.stringify(metas)).catch((erro) => {
+    sincronizarLinhasDoUsuario(TABELA_METAS, userId, metas, metaParaLinha).catch((erro) => {
       console.log('Não foi possível salvar as metas:', erro);
     });
-  }, [metas, carregandoMetas]);
+  }, [metas, carregandoMetas, userId]);
 
-  // Carrega contas fixas e dívidas uma vez só, quando essa aba abre. Como
-  // as abas são desmontadas ao trocar, voltar aqui sempre traz os dados
-  // mais recentes das outras telas.
+  // Carrega contas fixas e dívidas uma vez só, quando essa aba abre (só
+  // leitura, essa tela não grava nessas duas tabelas). Como as abas são
+  // desmontadas ao trocar, voltar aqui sempre traz os dados mais recentes
+  // das outras telas.
   useEffect(() => {
     async function carregarDadosExternos() {
       try {
-        const [contasSalvas, dividasSalvas] = await Promise.all([
-          AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_CONTAS_FIXAS),
-          AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_DIVIDAS),
+        const [contasCarregadas, dividasCarregadas] = await Promise.all([
+          buscarLinhasDoUsuario(TABELA_CONTAS_FIXAS, userId, linhaParaContaFixa),
+          buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida),
         ]);
-        if (contasSalvas !== null) setContasFixas(JSON.parse(contasSalvas));
-        if (dividasSalvas !== null) setDividas(JSON.parse(dividasSalvas).map(comCamposDivida));
+        setContasFixas(contasCarregadas);
+        setDividas(dividasCarregadas);
       } catch (erro) {
         console.log('Não foi possível carregar dados de outras abas:', erro);
       } finally {
@@ -2205,7 +2417,7 @@ function TelaInvestimentos() {
       }
     }
     carregarDadosExternos();
-  }, []);
+  }, [userId]);
 
   const resumo = calcularResumoInvestimentos(investimentos);
   const reserva = calcularReservaEmergencia(investimentos, contasFixas);
@@ -2806,6 +3018,8 @@ function TelaInvestimentos() {
 function TelaDividas() {
   const { estilos: styles, cores } = useTema();
   const { t } = useIdioma();
+  const { user } = useAuth();
+  const userId = user.id;
   const [dividas, setDividas] = useState(DIVIDAS_INICIAIS);
   const [carregandoDividas, setCarregandoDividas] = useState(true);
   const [estrategia, setEstrategia] = useState('avalanche');
@@ -2827,10 +3041,8 @@ function TelaDividas() {
   useEffect(() => {
     async function carregarDividasSalvas() {
       try {
-        const dadosSalvos = await AsyncStorage.getItem(CHAVE_ARMAZENAMENTO_DIVIDAS);
-        if (dadosSalvos !== null) {
-          setDividas(JSON.parse(dadosSalvos).map(comCamposDivida));
-        }
+        const dividasCarregadas = await buscarLinhasDoUsuario(TABELA_DIVIDAS, userId, linhaParaDivida);
+        setDividas(dividasCarregadas);
       } catch (erro) {
         console.log('Não foi possível carregar as dívidas salvas:', erro);
       } finally {
@@ -2838,18 +3050,18 @@ function TelaDividas() {
       }
     }
     carregarDividasSalvas();
-  }, []);
+  }, [userId]);
 
   // Toda vez que a lista de dívidas mudar (adicionar/remover), salva de
-  // novo no celular. O "if (carregandoDividas) return" evita que a gente
+  // novo no Supabase. O "if (carregandoDividas) return" evita que a gente
   // sobrescreva o que está salvo com os exemplos iniciais bem no instante
   // em que o app está abrindo, antes de terminar de carregar.
   useEffect(() => {
     if (carregandoDividas) return;
-    AsyncStorage.setItem(CHAVE_ARMAZENAMENTO_DIVIDAS, JSON.stringify(dividas)).catch((erro) => {
+    sincronizarLinhasDoUsuario(TABELA_DIVIDAS, userId, dividas, dividaParaLinha).catch((erro) => {
       console.log('Não foi possível salvar as dívidas:', erro);
     });
-  }, [dividas, carregandoDividas]);
+  }, [dividas, carregandoDividas, userId]);
 
   // Dívidas já quitadas (saldo zerado ou todas as parcelas pagas) saem da
   // conta de "total devido" e das simulações — elas não competem mais por
@@ -3212,6 +3424,176 @@ function TelaDividas() {
 }
 
 // ============================================================
+// LOGIN / CADASTRO — tela obrigatória antes de usar o app (Supabase Auth)
+// ============================================================
+// Traduz as mensagens de erro mais comuns do Supabase Auth pra um
+// português mais amigável. Se a mensagem não estiver no mapa, mostra ela
+// do jeito que veio (em inglês) — melhor que travar a tela.
+function traduzirErroAuth(mensagem) {
+  const mapa = {
+    'Invalid login credentials': 'E-mail ou senha incorretos.',
+    'Email not confirmed': 'Confirme seu e-mail antes de entrar (veja sua caixa de entrada).',
+    'User already registered': 'Já existe uma conta com esse e-mail.',
+    'A user with this email address has already been registered': 'Já existe uma conta com esse e-mail.',
+    'Password should be at least 6 characters': 'A senha precisa ter pelo menos 6 caracteres.',
+    'Unable to validate email address: invalid format': 'Digite um e-mail válido.',
+  };
+  return mapa[mensagem] || mensagem;
+}
+
+function TelaLogin() {
+  const { estilos: styles, cores, escuro } = useTema();
+  const insets = useSafeAreaInsets();
+
+  // "modo" alterna entre entrar numa conta que já existe e criar uma nova
+  const [modo, setModo] = useState('login'); // 'login' | 'cadastro'
+  const [email, setEmail] = useState('');
+  const [senha, setSenha] = useState('');
+  const [carregando, setCarregando] = useState(false);
+  const [mensagemInfo, setMensagemInfo] = useState(null);
+
+  async function aoConfirmar() {
+    const emailLimpo = email.trim();
+    setMensagemInfo(null);
+
+    if (!emailLimpo || !senha) {
+      Alert.alert('Ops', 'Preencha o e-mail e a senha.');
+      return;
+    }
+
+    setCarregando(true);
+    try {
+      if (modo === 'login') {
+        const { error } = await supabase.auth.signInWithPassword({ email: emailLimpo, password: senha });
+        if (error) Alert.alert('Ops', traduzirErroAuth(error.message));
+        // Se der certo, o "onAuthStateChange" (lá em App()) já troca a
+        // tela sozinho assim que a sessão aparecer — não precisa fazer
+        // nada aqui.
+      } else {
+        const { error } = await supabase.auth.signUp({ email: emailLimpo, password: senha });
+        if (error) {
+          Alert.alert('Ops', traduzirErroAuth(error.message));
+        } else {
+          setMensagemInfo(
+            'Conta criada! Se pedirmos confirmação por e-mail, dá uma olhada na sua caixa de entrada — senão, você já está logado.'
+          );
+        }
+      }
+    } catch (erro) {
+      Alert.alert('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+    } finally {
+      setCarregando(false);
+    }
+  }
+
+  async function aoEsquecerSenha() {
+    const emailLimpo = email.trim();
+    if (!emailLimpo) {
+      Alert.alert('Ops', 'Digite seu e-mail ali em cima e toque em "Esqueci minha senha" de novo.');
+      return;
+    }
+    setMensagemInfo(null);
+    setCarregando(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(emailLimpo);
+      if (error) {
+        Alert.alert('Ops', traduzirErroAuth(error.message));
+      } else {
+        setMensagemInfo('Se esse e-mail tiver uma conta, enviamos um link pra redefinir a senha. Confira sua caixa de entrada.');
+      }
+    } catch (erro) {
+      Alert.alert('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+    } finally {
+      setCarregando(false);
+    }
+  }
+
+  function alternarModo() {
+    setModo((atual) => (atual === 'login' ? 'cadastro' : 'login'));
+    setMensagemInfo(null);
+  }
+
+  return (
+    <View style={[styles.appContainer, { paddingTop: insets.top }]}>
+      <StatusBar style={escuro ? 'light' : 'dark'} />
+      <ScrollView
+        contentContainerStyle={[styles.listContent, { flexGrow: 1, justifyContent: 'center' }]}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={{ alignItems: 'center', marginBottom: 32 }}>
+          <View
+            style={[
+              styles.balanceIconWrapper,
+              { backgroundColor: cores.primarioFundo, marginBottom: 16 },
+            ]}
+          >
+            <Ionicons name="wallet" size={28} color={cores.primario} />
+          </View>
+          <Text style={styles.headerTitle}>Meu Financeiro</Text>
+          <Text style={[styles.headerSubtitle, { textAlign: 'center' }]}>
+            {modo === 'login'
+              ? 'Entre na sua conta pra continuar cuidando do seu dinheiro'
+              : 'Crie sua conta pra começar a usar o app'}
+          </Text>
+        </View>
+
+        <Text style={styles.inputLabel}>E-mail</Text>
+        <TextInput
+          style={styles.input}
+          value={email}
+          onChangeText={setEmail}
+          placeholder="seuemail@exemplo.com"
+          placeholderTextColor={cores.textoMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="email-address"
+          editable={!carregando}
+        />
+
+        <Text style={styles.inputLabel}>Senha</Text>
+        <TextInput
+          style={styles.input}
+          value={senha}
+          onChangeText={setSenha}
+          placeholder="Sua senha"
+          placeholderTextColor={cores.textoMuted}
+          secureTextEntry
+          editable={!carregando}
+        />
+
+        {mensagemInfo && (
+          <View style={[styles.purchaseResultBox, styles.purchaseResultBoxVerde]}>
+            <Text style={styles.purchaseResultText}>{mensagemInfo}</Text>
+          </View>
+        )}
+
+        <TouchableOpacity
+          style={[styles.modalConfirmButton, { flex: 0, marginTop: 8 }, carregando && { opacity: 0.7 }]}
+          onPress={aoConfirmar}
+          disabled={carregando}
+        >
+          <Text style={styles.modalConfirmButtonText}>
+            {carregando ? 'Só um instante...' : modo === 'login' ? 'Entrar' : 'Criar conta'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={{ marginTop: 20, alignItems: 'center' }} onPress={alternarModo} disabled={carregando}>
+          <Text style={styles.addButtonText}>
+            {modo === 'login' ? 'Ainda não tem conta? Criar conta' : 'Já tem conta? Entrar'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={{ marginTop: 14, alignItems: 'center' }} onPress={aoEsquecerSenha} disabled={carregando}>
+          <Text style={[styles.helperText, { textDecorationLine: 'underline', marginBottom: 0 }]}>
+            Esqueci minha senha
+          </Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ============================================================
 // APP — junta as duas abas com uma barra de navegação simples
 // ============================================================
 
@@ -3225,6 +3607,23 @@ function AppConteudo() {
   const insets = useSafeAreaInsets();
   const { estilos: styles, cores, escuro, alternarTema } = useTema();
   const { idioma, setIdioma, t } = useIdioma();
+
+  // "Sair" fecha a sessão no Supabase — o próprio onAuthStateChange (lá em
+  // App()) já cuida de trocar a tela pro login assim que isso acontecer,
+  // não precisa fazer mais nada por aqui.
+  function confirmarSair() {
+    Alert.alert(t('config.confirmarSairTitulo'), t('config.confirmarSairMensagem'), [
+      { text: t('comum.cancelar'), style: 'cancel' },
+      {
+        text: t('config.sair'),
+        style: 'destructive',
+        onPress: () => {
+          setModalConfigVisivel(false);
+          supabase.auth.signOut();
+        },
+      },
+    ]);
+  }
 
   return (
     <View style={[styles.appContainer, { paddingTop: insets.top }]}>
@@ -3349,6 +3748,12 @@ function AppConteudo() {
               ))}
             </View>
 
+            <Text style={styles.inputLabel}>{t('config.conta')}</Text>
+            <TouchableOpacity style={styles.logoutButton} onPress={confirmarSair}>
+              <Ionicons name="log-out-outline" size={18} color={cores.vermelhoTextoForte} />
+              <Text style={styles.logoutButtonText}>{t('config.sair')}</Text>
+            </TouchableOpacity>
+
             <TouchableOpacity
               style={styles.modalCancelButton}
               onPress={() => setModalConfigVisivel(false)}
@@ -3420,13 +3825,58 @@ export default function App() {
     t: criarFuncaoTraducao(idioma),
   };
 
+  // ---- Login obrigatório (Supabase Auth) ----
+  // "carregandoSessao" cobre só a checagem inicial (existe uma sessão
+  // salva no aparelho?). Depois disso, "onAuthStateChange" mantém tudo
+  // atualizado sozinho — tanto quando a pessoa entra/cria conta/sai dentro
+  // do próprio app quanto se o token expirar e for renovado em segundo
+  // plano.
+  const [session, setSession] = useState(null);
+  const [carregandoSessao, setCarregandoSessao] = useState(true);
+
+  useEffect(() => {
+    let ativo = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!ativo) return;
+      setSession(data.session);
+      setCarregandoSessao(false);
+    });
+
+    const { data: assinatura } = supabase.auth.onAuthStateChange((_evento, novaSessao) => {
+      if (!ativo) return;
+      setSession(novaSessao);
+      setCarregandoSessao(false);
+    });
+
+    return () => {
+      ativo = false;
+      assinatura.subscription.unsubscribe();
+    };
+  }, []);
+
+  const valorAuth = {
+    session,
+    user: session ? session.user : null,
+  };
+
   // O SafeAreaProvider precisa envolver todo o app pra medir as áreas
   // seguras do aparelho (notch, barra de status, barra de navegação).
   return (
     <SafeAreaProvider>
       <TemaContext.Provider value={valorTema}>
         <IdiomaContext.Provider value={valorIdioma}>
-          <AppConteudo />
+          {carregandoSessao ? (
+            <View style={valorTema.estilos.loadingContainer}>
+              <Text style={valorTema.estilos.loadingText}>Carregando...</Text>
+            </View>
+          ) : session ? (
+            <AuthContext.Provider value={valorAuth}>
+              <AppConteudo />
+            </AuthContext.Provider>
+          ) : (
+            <TelaLogin />
+          )}
         </IdiomaContext.Provider>
       </TemaContext.Provider>
     </SafeAreaProvider>
@@ -3549,6 +3999,23 @@ function useTema() {
 }
 
 // ============================================================
+// AUTENTICAÇÃO (Supabase Auth) — sessão da pessoa logada
+// ============================================================
+// Guarda a sessão atual (null = ninguém logado) e o usuário dela. Só
+// existe valor de verdade aqui DEPOIS do login, porque o próprio App()
+// só monta o resto do app (AuthContext.Provider + AppConteudo) quando já
+// existe uma sessão — então useAuth() dentro das telas sempre tem um
+// "user" válido.
+const AuthContext = React.createContext({
+  session: null,
+  user: null,
+});
+
+function useAuth() {
+  return React.useContext(AuthContext);
+}
+
+// ============================================================
 // IDIOMA (traduções) — português, inglês e espanhol
 // ============================================================
 // Cada texto do app tem uma "chave" (ex: "config.titulo") e um valor
@@ -3628,6 +4095,10 @@ const TRADUCOES = {
       claro: '☀️ Claro',
       escuro: '🌙 Escuro',
       idioma: 'Idioma',
+      conta: 'Conta',
+      sair: 'Sair',
+      confirmarSairTitulo: 'Sair da conta',
+      confirmarSairMensagem: 'Tem certeza que quer sair? Você vai precisar entrar de novo com seu e-mail e senha.',
     },
     dividas: {
       saldoDevedor: 'Saldo devedor',
@@ -3900,6 +4371,10 @@ const TRADUCOES = {
       claro: '☀️ Light',
       escuro: '🌙 Dark',
       idioma: 'Language',
+      conta: 'Account',
+      sair: 'Log out',
+      confirmarSairTitulo: 'Log out',
+      confirmarSairMensagem: 'Are you sure you want to log out? You will need to sign in again with your email and password.',
     },
     dividas: {
       saldoDevedor: 'Outstanding balance',
@@ -4172,6 +4647,10 @@ const TRADUCOES = {
       claro: '☀️ Claro',
       escuro: '🌙 Oscuro',
       idioma: 'Idioma',
+      conta: 'Cuenta',
+      sair: 'Cerrar sesión',
+      confirmarSairTitulo: 'Cerrar sesión',
+      confirmarSairMensagem: '¿Seguro que quieres cerrar sesión? Vas a tener que entrar de nuevo con tu correo y contraseña.',
     },
     dividas: {
       saldoDevedor: 'Saldo pendiente',
@@ -5135,6 +5614,21 @@ function criarEstilos(cores) {
       backgroundColor: cores.primario,
     },
     modalConfirmButtonText: { fontSize: 14, fontWeight: '600', color: cores.branco },
+
+    // Botão de "Sair" (logout), no modal de configurações
+    logoutButton: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      paddingVertical: 14,
+      borderRadius: 12,
+      backgroundColor: cores.vermelhoFundo,
+      borderWidth: 1,
+      borderColor: cores.vermelhoBorda,
+      marginBottom: 16,
+    },
+    logoutButtonText: { fontSize: 14, fontWeight: '600', color: cores.vermelhoTextoForte },
 
     // Barra de abas (feita na mão, sem biblioteca)
     tabBar: {
