@@ -3621,6 +3621,105 @@ function TelaLogin() {
 }
 
 // ============================================================
+// NOVA SENHA — tela que aparece depois do link de "esqueci minha senha"
+// ============================================================
+// Quando a pessoa clica no link que chegou por e-mail, o Supabase abre
+// uma sessão temporária só pra isso. Aqui ela escolhe a senha nova.
+function TelaNovaSenha({ aoTerminar }) {
+  const { estilos: styles, cores, escuro } = useTema();
+  const insets = useSafeAreaInsets();
+
+  const [senha, setSenha] = useState('');
+  const [confirmacao, setConfirmacao] = useState('');
+  const [carregando, setCarregando] = useState(false);
+
+  async function salvarNovaSenha() {
+    if (!senha || !confirmacao) {
+      avisar('Ops', 'Preencha a nova senha nos dois campos.');
+      return;
+    }
+    if (senha !== confirmacao) {
+      avisar('Ops', 'As duas senhas não são iguais.');
+      return;
+    }
+    if (senha.length < 6) {
+      avisar('Ops', 'A senha precisa ter pelo menos 6 caracteres.');
+      return;
+    }
+
+    setCarregando(true);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: senha });
+      if (error) {
+        avisar('Ops', traduzirErroAuth(error.message));
+      } else {
+        avisar('Pronto!', 'Sua senha foi alterada.');
+        aoTerminar();
+      }
+    } catch (erro) {
+      avisar('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+    } finally {
+      setCarregando(false);
+    }
+  }
+
+  return (
+    <View style={[styles.appContainer, { paddingTop: insets.top }]}>
+      <StatusBar style={escuro ? 'light' : 'dark'} />
+      <ScrollView
+        contentContainerStyle={[
+          styles.listContent,
+          { flexGrow: 1, justifyContent: 'center', width: '100%', maxWidth: 460, alignSelf: 'center' },
+        ]}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={{ alignItems: 'center', marginBottom: 32 }}>
+          <View style={[styles.balanceIconWrapper, { backgroundColor: cores.primarioFundo, marginBottom: 16 }]}>
+            <Ionicons name="key" size={28} color={cores.primario} />
+          </View>
+          <Text style={styles.headerTitle}>Escolher nova senha</Text>
+          <Text style={[styles.headerSubtitle, { textAlign: 'center' }]}>
+            Digite a senha nova duas vezes pra confirmar
+          </Text>
+        </View>
+
+        <Text style={styles.inputLabel}>Nova senha</Text>
+        <TextInput
+          style={styles.input}
+          value={senha}
+          onChangeText={setSenha}
+          placeholder="Pelo menos 6 caracteres"
+          placeholderTextColor={cores.textoMuted}
+          secureTextEntry
+          editable={!carregando}
+        />
+
+        <Text style={styles.inputLabel}>Repita a nova senha</Text>
+        <TextInput
+          style={styles.input}
+          value={confirmacao}
+          onChangeText={setConfirmacao}
+          placeholder="Digite de novo"
+          placeholderTextColor={cores.textoMuted}
+          secureTextEntry
+          editable={!carregando}
+        />
+
+        <TouchableOpacity
+          style={[styles.modalConfirmButton, { flex: 0, marginTop: 8 }, carregando && { opacity: 0.7 }]}
+          onPress={salvarNovaSenha}
+          disabled={carregando}
+        >
+          <Text style={styles.modalConfirmButtonText}>
+            {carregando ? 'Salvando...' : 'Salvar nova senha'}
+          </Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ============================================================
 // PROVEDOR DE AVISOS — o modal que substitui o Alert no site
 // ============================================================
 // Fica "por cima" de todo o app. Quando alguma parte do código chama
@@ -3932,9 +4031,24 @@ export default function App() {
   // plano.
   const [session, setSession] = useState(null);
   const [carregandoSessao, setCarregandoSessao] = useState(true);
+  // Fica true só enquanto a pessoa está redefinindo a senha (depois de
+  // clicar no link que chegou por e-mail).
+  const [redefinindoSenha, setRedefinindoSenha] = useState(false);
 
   useEffect(() => {
     let ativo = true;
+
+    // No site, o link de "esqueci minha senha" volta com "type=recovery"
+    // na própria URL. Olhar isso aqui garante que a tela de nova senha
+    // apareça mesmo se o aviso do Supabase (PASSWORD_RECOVERY) demorar.
+    if (
+      Platform.OS === 'web' &&
+      typeof window !== 'undefined' &&
+      window.location &&
+      (window.location.hash || '').includes('type=recovery')
+    ) {
+      setRedefinindoSenha(true);
+    }
 
     supabase.auth.getSession().then(({ data }) => {
       if (!ativo) return;
@@ -3942,8 +4056,13 @@ export default function App() {
       setCarregandoSessao(false);
     });
 
-    const { data: assinatura } = supabase.auth.onAuthStateChange((_evento, novaSessao) => {
+    const { data: assinatura } = supabase.auth.onAuthStateChange((evento, novaSessao) => {
       if (!ativo) return;
+      // Quando a pessoa clica no link de "esqueci minha senha" que chegou
+      // por e-mail, o Supabase avisa aqui com o evento PASSWORD_RECOVERY.
+      // Aí, em vez do app normal, mostramos a tela pra escolher a senha
+      // nova (ver TelaNovaSenha).
+      if (evento === 'PASSWORD_RECOVERY') setRedefinindoSenha(true);
       setSession(novaSessao);
       setCarregandoSessao(false);
     });
@@ -3970,6 +4089,8 @@ export default function App() {
               <View style={valorTema.estilos.loadingContainer}>
                 <Text style={valorTema.estilos.loadingText}>Carregando...</Text>
               </View>
+            ) : session && redefinindoSenha ? (
+              <TelaNovaSenha aoTerminar={() => setRedefinindoSenha(false)} />
             ) : session ? (
               <AuthContext.Provider value={valorAuth}>
                 <AppConteudo />
