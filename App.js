@@ -29,6 +29,27 @@ import DateTimePicker from '@react-native-community/datetimepicker';
 import { supabase } from './lib/supabase';
 
 // ============================================================
+// AVISOS E CONFIRMAÇÕES (funcionam no celular E no site)
+// ============================================================
+// No celular, o React Native tem o "Alert.alert" pronto. Só que na
+// versão web ele simplesmente não faz nada — os avisos de erro e as
+// perguntas de "tem certeza?" sumiriam sem ninguém ver.
+//
+// Pra resolver, o app inteiro chama "avisar(...)" no lugar de
+// "Alert.alert(...)". No celular ela usa o alerta nativo; no site ela
+// abre um modal do próprio app (ver "ProvedorDeAvisos" lá embaixo, que
+// é quem registra a função nessa variável aqui).
+let _abrirAvisoNaTela = null;
+
+function avisar(titulo, mensagem, botoes) {
+  if (Platform.OS === 'web' && _abrirAvisoNaTela) {
+    _abrirAvisoNaTela({ titulo, mensagem, botoes: botoes || null });
+    return;
+  }
+  Alert.alert(titulo, mensagem, botoes);
+}
+
+// ============================================================
 // FUNÇÕES AUXILIARES (usadas em várias partes do app)
 // ============================================================
 
@@ -991,7 +1012,7 @@ function TelaInicio() {
   const secoesTransacoes = agruparTransacoesPorMes(transacoes, t);
 
   function confirmarRemocao(id) {
-    Alert.alert(t('inicio.confirmarRemocaoTransacaoTitulo'), t('inicio.confirmarRemocaoTransacaoMensagem'), [
+    avisar(t('inicio.confirmarRemocaoTransacaoTitulo'), t('inicio.confirmarRemocaoTransacaoMensagem'), [
       { text: t('comum.cancelar'), style: 'cancel' },
       {
         text: t('comum.remover'),
@@ -1014,11 +1035,11 @@ function TelaInicio() {
     const valor = paraNumero(novoValor);
 
     if (!novoTitulo.trim()) {
-      Alert.alert(t('comum.ops'), t('inicio.erroDescricao'));
+      avisar(t('comum.ops'), t('inicio.erroDescricao'));
       return;
     }
     if (valor <= 0) {
-      Alert.alert(t('comum.ops'), t('inicio.erroValor'));
+      avisar(t('comum.ops'), t('inicio.erroValor'));
       return;
     }
 
@@ -1026,7 +1047,7 @@ function TelaInicio() {
     const totalParcelas = usarParcelamento ? parseInt(numeroParcelasCompra, 10) : 1;
 
     if (usarParcelamento && (!totalParcelas || totalParcelas < 2)) {
-      Alert.alert(t('comum.ops'), t('inicio.erroNumeroParcelasCompra'));
+      avisar(t('comum.ops'), t('inicio.erroNumeroParcelasCompra'));
       return;
     }
 
@@ -1097,15 +1118,15 @@ function TelaInicio() {
     const dia = parseInt(novoDiaFixa, 10);
 
     if (!novoTituloFixa.trim()) {
-      Alert.alert(t('comum.ops'), t('inicio.erroNomeContaFixa'));
+      avisar(t('comum.ops'), t('inicio.erroNomeContaFixa'));
       return;
     }
     if (valor <= 0) {
-      Alert.alert(t('comum.ops'), t('inicio.erroValor'));
+      avisar(t('comum.ops'), t('inicio.erroValor'));
       return;
     }
     if (!dia || dia < 1 || dia > 28) {
-      Alert.alert(t('comum.ops'), t('inicio.erroDiaContaFixa'));
+      avisar(t('comum.ops'), t('inicio.erroDiaContaFixa'));
       return;
     }
 
@@ -1169,7 +1190,7 @@ function TelaInicio() {
   }
 
   function removerContaFixa(id) {
-    Alert.alert(
+    avisar(
       t('inicio.confirmarRemocaoContaFixaTitulo'),
       t('inicio.confirmarRemocaoContaFixaMensagem'),
       [
@@ -2458,7 +2479,7 @@ function TelaInvestimentos() {
   }
 
   function confirmarRemocao(id) {
-    Alert.alert(t('investimentos.confirmarRemocaoTitulo'), t('investimentos.confirmarRemocaoMensagem'), [
+    avisar(t('investimentos.confirmarRemocaoTitulo'), t('investimentos.confirmarRemocaoMensagem'), [
       { text: t('comum.cancelar'), style: 'cancel' },
       {
         text: t('comum.remover'),
@@ -2473,15 +2494,15 @@ function TelaInvestimentos() {
     const valorAtual = novoValorAtual.trim() ? paraNumero(novoValorAtual) : valorInvestido;
 
     if (!novoNome.trim()) {
-      Alert.alert(t('comum.ops'), t('investimentos.erroNome'));
+      avisar(t('comum.ops'), t('investimentos.erroNome'));
       return;
     }
     if (valorInvestido <= 0) {
-      Alert.alert(t('comum.ops'), t('investimentos.erroValorInvestido'));
+      avisar(t('comum.ops'), t('investimentos.erroValorInvestido'));
       return;
     }
     if (valorAtual < 0) {
-      Alert.alert(t('comum.ops'), t('investimentos.erroValorAtual'));
+      avisar(t('comum.ops'), t('investimentos.erroValorAtual'));
       return;
     }
 
@@ -2530,7 +2551,7 @@ function TelaInvestimentos() {
   }
 
   function confirmarRemocaoMeta(id) {
-    Alert.alert(t('investimentos.confirmarRemocaoMetaTitulo'), t('investimentos.confirmarRemocaoMetaMensagem'), [
+    avisar(t('investimentos.confirmarRemocaoMetaTitulo'), t('investimentos.confirmarRemocaoMetaMensagem'), [
       { text: t('comum.cancelar'), style: 'cancel' },
       {
         text: t('comum.remover'),
@@ -2552,15 +2573,15 @@ function TelaInvestimentos() {
     const valorAtual = novoValorAtualMeta.trim() ? paraNumero(novoValorAtualMeta) : 0;
 
     if (!novoNomeMeta.trim()) {
-      Alert.alert(t('comum.ops'), t('investimentos.erroNomeMeta'));
+      avisar(t('comum.ops'), t('investimentos.erroNomeMeta'));
       return;
     }
     if (valorAlvo <= 0) {
-      Alert.alert(t('comum.ops'), t('investimentos.erroValorAlvoMeta'));
+      avisar(t('comum.ops'), t('investimentos.erroValorAlvoMeta'));
       return;
     }
     if (valorAtual < 0) {
-      Alert.alert(t('comum.ops'), t('investimentos.erroValorAtualMeta'));
+      avisar(t('comum.ops'), t('investimentos.erroValorAtualMeta'));
       return;
     }
 
@@ -3093,7 +3114,7 @@ function TelaDividas() {
         .join(',');
 
   function confirmarRemocao(id) {
-    Alert.alert(t('dividas.confirmarRemocaoTitulo'), t('dividas.confirmarRemocaoMensagem'), [
+    avisar(t('dividas.confirmarRemocaoTitulo'), t('dividas.confirmarRemocaoMensagem'), [
       { text: t('comum.cancelar'), style: 'cancel' },
       { text: t('comum.remover'), style: 'destructive', onPress: () => {
         setDividas((atual) => atual.filter((d) => d.id !== id));
@@ -3129,19 +3150,19 @@ function TelaDividas() {
     const numeroParcelas = numeroParcelasTexto ? parseInt(numeroParcelasTexto, 10) : 0;
 
     if (!novoNome.trim()) {
-      Alert.alert(t('comum.ops'), t('dividas.erroNome'));
+      avisar(t('comum.ops'), t('dividas.erroNome'));
       return;
     }
     if (saldo <= 0) {
-      Alert.alert(t('comum.ops'), t('dividas.erroSaldo'));
+      avisar(t('comum.ops'), t('dividas.erroSaldo'));
       return;
     }
     if (parcela <= 0) {
-      Alert.alert(t('comum.ops'), t('dividas.erroParcela'));
+      avisar(t('comum.ops'), t('dividas.erroParcela'));
       return;
     }
     if (numeroParcelasTexto && (isNaN(numeroParcelas) || numeroParcelas <= 0)) {
-      Alert.alert(t('comum.ops'), t('dividas.erroNumeroParcelas'));
+      avisar(t('comum.ops'), t('dividas.erroNumeroParcelas'));
       return;
     }
 
@@ -3457,7 +3478,7 @@ function TelaLogin() {
     setMensagemInfo(null);
 
     if (!emailLimpo || !senha) {
-      Alert.alert('Ops', 'Preencha o e-mail e a senha.');
+      avisar('Ops', 'Preencha o e-mail e a senha.');
       return;
     }
 
@@ -3465,14 +3486,14 @@ function TelaLogin() {
     try {
       if (modo === 'login') {
         const { error } = await supabase.auth.signInWithPassword({ email: emailLimpo, password: senha });
-        if (error) Alert.alert('Ops', traduzirErroAuth(error.message));
+        if (error) avisar('Ops', traduzirErroAuth(error.message));
         // Se der certo, o "onAuthStateChange" (lá em App()) já troca a
         // tela sozinho assim que a sessão aparecer — não precisa fazer
         // nada aqui.
       } else {
         const { error } = await supabase.auth.signUp({ email: emailLimpo, password: senha });
         if (error) {
-          Alert.alert('Ops', traduzirErroAuth(error.message));
+          avisar('Ops', traduzirErroAuth(error.message));
         } else {
           setMensagemInfo(
             'Conta criada! Se pedirmos confirmação por e-mail, dá uma olhada na sua caixa de entrada — senão, você já está logado.'
@@ -3480,7 +3501,7 @@ function TelaLogin() {
         }
       }
     } catch (erro) {
-      Alert.alert('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+      avisar('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
     } finally {
       setCarregando(false);
     }
@@ -3489,7 +3510,7 @@ function TelaLogin() {
   async function aoEsquecerSenha() {
     const emailLimpo = email.trim();
     if (!emailLimpo) {
-      Alert.alert('Ops', 'Digite seu e-mail ali em cima e toque em "Esqueci minha senha" de novo.');
+      avisar('Ops', 'Digite seu e-mail ali em cima e toque em "Esqueci minha senha" de novo.');
       return;
     }
     setMensagemInfo(null);
@@ -3497,12 +3518,12 @@ function TelaLogin() {
     try {
       const { error } = await supabase.auth.resetPasswordForEmail(emailLimpo);
       if (error) {
-        Alert.alert('Ops', traduzirErroAuth(error.message));
+        avisar('Ops', traduzirErroAuth(error.message));
       } else {
         setMensagemInfo('Se esse e-mail tiver uma conta, enviamos um link pra redefinir a senha. Confira sua caixa de entrada.');
       }
     } catch (erro) {
-      Alert.alert('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
+      avisar('Ops', 'Não foi possível conectar. Verifique sua internet e tente de novo.');
     } finally {
       setCarregando(false);
     }
@@ -3594,6 +3615,70 @@ function TelaLogin() {
 }
 
 // ============================================================
+// PROVEDOR DE AVISOS — o modal que substitui o Alert no site
+// ============================================================
+// Fica "por cima" de todo o app. Quando alguma parte do código chama
+// "avisar(...)" na versão web, é esse modal aqui que aparece — com o
+// mesmo visual (e as mesmas cores de tema) do resto do app.
+function ProvedorDeAvisos({ children }) {
+  const { estilos: styles, cores } = useTema();
+  const [aviso, setAviso] = useState(null);
+
+  useEffect(() => {
+    _abrirAvisoNaTela = setAviso;
+    return () => {
+      _abrirAvisoNaTela = null;
+    };
+  }, []);
+
+  function fechar() {
+    setAviso(null);
+  }
+
+  // Se quem chamou não passou botões, mostra só um "OK" que fecha.
+  const botoes = aviso && aviso.botoes && aviso.botoes.length > 0 ? aviso.botoes : [{ text: 'OK' }];
+
+  return (
+    <>
+      {children}
+      <Modal visible={aviso !== null} transparent animationType="fade" onRequestClose={fechar}>
+        <View style={[styles.modalOverlay, { justifyContent: 'center', padding: 24 }]}>
+          <View style={[styles.modalContent, { borderRadius: 20, paddingBottom: 24 }]}>
+            {aviso && aviso.titulo ? <Text style={styles.modalTitle}>{aviso.titulo}</Text> : null}
+            {aviso && aviso.mensagem ? (
+              <Text style={[styles.helperText, { marginBottom: 20 }]}>{aviso.mensagem}</Text>
+            ) : null}
+            <View style={styles.modalButtonsRow}>
+              {botoes.map((botao, indice) => {
+                const ehCancelar = botao.style === 'cancel';
+                const ehDestrutivo = botao.style === 'destructive';
+                return (
+                  <TouchableOpacity
+                    key={indice}
+                    style={[
+                      ehCancelar ? styles.modalCancelButton : styles.modalConfirmButton,
+                      ehDestrutivo && { backgroundColor: cores.vermelhoTextoForte },
+                    ]}
+                    onPress={() => {
+                      fechar();
+                      if (botao.onPress) botao.onPress();
+                    }}
+                  >
+                    <Text style={ehCancelar ? styles.modalCancelButtonText : styles.modalConfirmButtonText}>
+                      {botao.text}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </>
+  );
+}
+
+// ============================================================
 // APP — junta as duas abas com uma barra de navegação simples
 // ============================================================
 
@@ -3612,7 +3697,7 @@ function AppConteudo() {
   // App()) já cuida de trocar a tela pro login assim que isso acontecer,
   // não precisa fazer mais nada por aqui.
   function confirmarSair() {
-    Alert.alert(t('config.confirmarSairTitulo'), t('config.confirmarSairMensagem'), [
+    avisar(t('config.confirmarSairTitulo'), t('config.confirmarSairMensagem'), [
       { text: t('comum.cancelar'), style: 'cancel' },
       {
         text: t('config.sair'),
@@ -3866,17 +3951,19 @@ export default function App() {
     <SafeAreaProvider>
       <TemaContext.Provider value={valorTema}>
         <IdiomaContext.Provider value={valorIdioma}>
-          {carregandoSessao ? (
-            <View style={valorTema.estilos.loadingContainer}>
-              <Text style={valorTema.estilos.loadingText}>Carregando...</Text>
-            </View>
-          ) : session ? (
-            <AuthContext.Provider value={valorAuth}>
-              <AppConteudo />
-            </AuthContext.Provider>
-          ) : (
-            <TelaLogin />
-          )}
+          <ProvedorDeAvisos>
+            {carregandoSessao ? (
+              <View style={valorTema.estilos.loadingContainer}>
+                <Text style={valorTema.estilos.loadingText}>Carregando...</Text>
+              </View>
+            ) : session ? (
+              <AuthContext.Provider value={valorAuth}>
+                <AppConteudo />
+              </AuthContext.Provider>
+            ) : (
+              <TelaLogin />
+            )}
+          </ProvedorDeAvisos>
         </IdiomaContext.Provider>
       </TemaContext.Provider>
     </SafeAreaProvider>
