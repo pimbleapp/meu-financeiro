@@ -3538,7 +3538,13 @@ function TelaLogin() {
     <View style={[styles.appContainer, { paddingTop: insets.top }]}>
       <StatusBar style={escuro ? 'light' : 'dark'} />
       <ScrollView
-        contentContainerStyle={[styles.listContent, { flexGrow: 1, justifyContent: 'center' }]}
+        contentContainerStyle={[
+          styles.listContent,
+          // No computador, o formulário fica centralizado e com largura
+          // limitada (senão os campos ficariam esticados de ponta a ponta
+          // da tela). No celular ele continua ocupando a largura toda.
+          { flexGrow: 1, justifyContent: 'center', width: '100%', maxWidth: 460, alignSelf: 'center' },
+        ]}
         keyboardShouldPersistTaps="handled"
       >
         <View style={{ alignItems: 'center', marginBottom: 32 }}>
@@ -3643,7 +3649,15 @@ function ProvedorDeAvisos({ children }) {
       {children}
       <Modal visible={aviso !== null} transparent animationType="fade" onRequestClose={fechar}>
         <View style={[styles.modalOverlay, { justifyContent: 'center', padding: 24 }]}>
-          <View style={[styles.modalContent, { borderRadius: 20, paddingBottom: 24 }]}>
+          <View
+            style={[
+              styles.modalContent,
+              // Em celular ocupa a largura toda; em telas grandes (site no
+              // computador) vira uma caixinha centralizada, em vez de uma
+              // faixa esticada de ponta a ponta.
+              { borderRadius: 20, paddingBottom: 24, width: '100%', maxWidth: 420, alignSelf: 'center' },
+            ]}
+          >
             {aviso && aviso.titulo ? <Text style={styles.modalTitle}>{aviso.titulo}</Text> : null}
             {aviso && aviso.mensagem ? (
               <Text style={[styles.helperText, { marginBottom: 20 }]}>{aviso.mensagem}</Text>
