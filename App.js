@@ -116,6 +116,39 @@ function arredondar2(valor) {
   return Math.round(valor * 100) / 100;
 }
 
+// Teto de sanidade pros valores em reais. Serve pra dois problemas:
+// (1) erro de digitação (a pessoa digita um número absurdo sem querer) e
+// (2) estouro de ponto flutuante nas projeções de juros, que gerava
+// aberrações tipo "R$ 181.055.753.449.186.500.000.000,00" na tela.
+const VALOR_MAXIMO = 1000000000; // 1 bilhão de reais
+// Teto da taxa de juros mensal. Acima de 100% ao mês é quase sempre erro
+// de digitação (ninguém tem dívida a 445% ao mês por engano).
+const TAXA_JUROS_MAXIMA = 100; // % ao mês
+
+// Gera um identificador único e imprevisível pra cada registro.
+// Antes usávamos Date.now() (o horário em milissegundos), mas isso era
+// ruim por dois motivos: dois registros criados no mesmo instante ganhavam
+// o MESMO id (um sobrescrevia o outro), e como o id é chave primária
+// compartilhada entre TODAS as contas no banco, um horário é fácil de
+// adivinhar. Um UUID aleatório elimina colisão e não dá pra adivinhar.
+function gerarId() {
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.randomUUID) {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch (e) {
+    // se crypto não existir nesta plataforma, cai no plano B abaixo
+  }
+  // Plano B (sem crypto): horário em base36 + dois blocos aleatórios.
+  // Continua praticamente sem chance de colisão e difícil de adivinhar.
+  return (
+    Date.now().toString(36) +
+    '-' +
+    Math.random().toString(36).slice(2, 10) +
+    Math.random().toString(36).slice(2, 10)
+  );
+}
+
 // Divide uma compra em N parcelas iguais (a última absorve a sobra de
 // centavos, pra soma bater certinho com o valor original), uma por mês
 // a partir da data escolhida. Usada tanto pra lançar de verdade quanto
@@ -1505,7 +1538,7 @@ function TelaInicio() {
     if (!usarParcelamento || totalParcelas === 1) {
       // Transação normal, à vista
       const novaTransacao = {
-        id: Date.now().toString(),
+        id: gerarId(),
         titulo: novoTitulo.trim(),
         valor,
         tipo: novoTipo,
@@ -1518,7 +1551,7 @@ function TelaInicio() {
       // no mês certo lá na frente. Elas aparecem no histórico desde já,
       // mas só entram no saldo quando a data de cada uma chegar (por causa
       // do filtro "transacoesJaOcorridas" lá em cima).
-      const idCompra = Date.now().toString();
+      const idCompra = gerarId();
       const parcelasGeradas = gerarParcelasFuturas(valor, totalParcelas, dataSelecionada, idCompra);
       const novasParcelas = parcelasGeradas.map((p) => ({
         id: `${idCompra}-${p.numero}`,
@@ -1590,7 +1623,7 @@ function TelaInicio() {
       if (statusRecebidoEditando && !jaEstavaConfirmadaEsseMes) {
         // Passou a ser confirmada agora: lança a transação desse mês
         const dataLancamento = new Date(hoje.getFullYear(), hoje.getMonth(), dia);
-        idTransacaoConfirmada = Date.now().toString();
+        idTransacaoConfirmada = gerarId();
         const novaTransacao = {
           id: idTransacaoConfirmada,
           titulo: novoTituloFixa.trim(),
@@ -1625,7 +1658,7 @@ function TelaInicio() {
     } else {
       // Criando uma conta fixa nova
       const novaContaFixa = {
-        id: Date.now().toString(),
+        id: gerarId(),
         titulo: novoTituloFixa.trim(),
         valor,
         tipo: novoTipoFixa,
@@ -1662,7 +1695,7 @@ function TelaInicio() {
   // ia criar uma transação nova a cada clique, sem nunca remover nenhuma.
   function confirmarContaFixa(contaFixa) {
     const dataLancamento = new Date(hoje.getFullYear(), hoje.getMonth(), contaFixa.diaDoMes);
-    const idNovaTransacao = Date.now().toString();
+    const idNovaTransacao = gerarId();
 
     const novaTransacao = {
       id: idNovaTransacao,
@@ -1716,7 +1749,7 @@ function TelaInicio() {
   function confirmarParcelaDivida(divida) {
     const juros = divida.saldoDevedor * (divida.taxaJurosMensal / 100);
     const novoSaldo = Math.max(0, arredondar2(divida.saldoDevedor + juros - divida.parcelaMinima));
-    const idNovaTransacao = Date.now().toString();
+    const idNovaTransacao = gerarId();
 
     const novaTransacao = {
       id: idNovaTransacao,
@@ -2177,7 +2210,11 @@ function TelaInicio() {
                   {t('inicio.parcelaDeValor', { valor: formatarMoeda(d.parcelaMinima) })}
                   {d.numeroParcelas > 0
                     ? ` · ${t('inicio.xDeYPagas', { pagas: parcelasPagas, total: d.numeroParcelas })}`
-                    : ` · ${t('inicio.xPagas', { pagas: parcelasPagas })}`}
+                    : ` · ${
+                        parcelasPagas === 0
+                          ? t('inicio.nenhumaPaga')
+                          : t('inicio.xPagas', { pagas: parcelasPagas })
+                      }`}
                 </Text>
               </View>
 
@@ -2216,13 +2253,19 @@ function TelaInicio() {
       ) : (
         <View style={styles.timeMachineCard}>
           <Text style={styles.timeMachineTexto}>
-            {t('inicio.mediaDosUltimosMeses', {
-              meses: projecaoFinanceira.mesesConsiderados,
-              mesOuMeses: projecaoFinanceira.mesesConsiderados === 1 ? t('inicio.mes') : t('inicio.meses'),
-              sobraOuDeficit:
-                projecaoFinanceira.mediaMensal >= 0 ? t('inicio.umaSobra') : t('inicio.umDeficit'),
-              valor: formatarMoeda(Math.abs(projecaoFinanceira.mediaMensal)),
-            })}
+            {t(
+              // Com 1 mês a frase é outra ("No último mês..."), senão sairia
+              // "Nos últimos 1 mês".
+              projecaoFinanceira.mesesConsiderados === 1
+                ? 'inicio.mediaDoUltimoMes'
+                : 'inicio.mediaDosUltimosMeses',
+              {
+                meses: projecaoFinanceira.mesesConsiderados,
+                sobraOuDeficit:
+                  projecaoFinanceira.mediaMensal >= 0 ? t('inicio.umaSobra') : t('inicio.umDeficit'),
+                valor: formatarMoeda(Math.abs(projecaoFinanceira.mediaMensal)),
+              }
+            )}
           </Text>
           <Text style={[styles.timeMachineTexto, { marginBottom: 10 }]}>
             {t('inicio.seContinuarNesseRitmo')}
@@ -2559,6 +2602,13 @@ function simularQuitacao(dividasOrdenadas, extraMensal) {
   let mes = 0;
   const LIMITE_MESES = 600; // trava de segurança (50 anos) pra não travar o app
 
+  // Guarda o saldo total do mês anterior. Se num mês inteiro o saldo não
+  // diminuir nada, é porque a parcela não cobre nem os juros: a dívida
+  // NUNCA vai quitar desse jeito. Aí a gente para e avisa, em vez de somar
+  // juros pra sempre — era isso que gerava aquele "R$ 181.055...bilhões"
+  // absurdo na tela (o número estourava o limite do ponto flutuante).
+  let saldoTotalAnterior = Infinity;
+
   while (dividas.some((d) => d.saldoDevedor > 0.01) && mes < LIMITE_MESES) {
     mes++;
     const alvo = dividas.find((d) => d.saldoDevedor > 0.01);
@@ -2578,12 +2628,21 @@ function simularQuitacao(dividasOrdenadas, extraMensal) {
 
       return { ...d, saldoDevedor: novoSaldo - pagamento };
     });
+
+    const saldoTotal = dividas.reduce((s, d) => s + Math.max(0, d.saldoDevedor), 0);
+    if (saldoTotal >= saldoTotalAnterior - 0.01) {
+      // O saldo não caiu neste mês: a dívida está "andando pra trás" ou
+      // parada. Não tem como quitar com esses valores.
+      return { meses: mes, totalJurosPago, quitouTudo: false, naoQuita: true };
+    }
+    saldoTotalAnterior = saldoTotal;
   }
 
   return {
     meses: mes,
     totalJurosPago,
     quitouTudo: dividas.every((d) => d.saldoDevedor <= 0.01),
+    naoQuita: false,
   };
 }
 
@@ -2936,7 +2995,7 @@ function TelaInvestimentos() {
       setInvestimentos((atual) => [
         ...atual,
         {
-          id: Date.now().toString(),
+          id: gerarId(),
           nome: novoNome.trim(),
           tipo: novoTipo,
           valorInvestido,
@@ -3015,7 +3074,7 @@ function TelaInvestimentos() {
       setMetas((atual) => [
         ...atual,
         {
-          id: Date.now().toString(),
+          id: gerarId(),
           nome: novoNomeMeta.trim(),
           valorAlvo,
           valorAtual,
@@ -3242,7 +3301,7 @@ function TelaInvestimentos() {
           placeholder={t('investimentos.placeholderAporte')}
         />
 
-        <Text style={styles.inputLabel}>{t('investimentos.retornoEsperadoLabel')}</Text>
+        <Text style={styles.inputLabel}>{t('investimentos.retornoEsperadoSimuladorLabel')}</Text>
         <TextInput
           style={styles.input}
           value={taxaSimulacaoTexto}
@@ -3560,8 +3619,16 @@ function TelaDividas() {
       avisar(t('comum.ops'), t('dividas.erroSaldo'));
       return;
     }
+    if (saldo > VALOR_MAXIMO || parcela > VALOR_MAXIMO) {
+      avisar(t('comum.ops'), t('dividas.erroValorAlto'));
+      return;
+    }
     if (parcela <= 0) {
       avisar(t('comum.ops'), t('dividas.erroParcela'));
+      return;
+    }
+    if (taxa < 0 || taxa > TAXA_JUROS_MAXIMA) {
+      avisar(t('comum.ops'), t('dividas.erroTaxa'));
       return;
     }
     if (numeroParcelasTexto && (isNaN(numeroParcelas) || numeroParcelas <= 0)) {
@@ -3589,7 +3656,7 @@ function TelaDividas() {
       );
     } else {
       const novaDivida = {
-        id: Date.now().toString(),
+        id: gerarId(),
         nome: novoNome.trim(),
         saldoDevedor: saldo,
         taxaJurosMensal: taxa,
@@ -3663,12 +3730,16 @@ function TelaDividas() {
                     <Text style={styles.comparisonTitle}>{t('dividas.estrategiaMenorJuros')}</Text>
                     <Text style={styles.comparisonValue}>
                       {simAvalanche.quitouTudo
-                        ? t('dividas.resultadoMeses', { meses: simAvalanche.meses })
+                        ? simAvalanche.meses === 1
+                          ? t('dividas.resultadoUmMes')
+                          : t('dividas.resultadoMeses', { meses: simAvalanche.meses })
                         : t('dividas.naoQuitaAssim')}
                     </Text>
-                    <Text style={styles.comparisonSubtitle}>
-                      {t('dividas.jurosTotal', { valor: formatarMoeda(simAvalanche.totalJurosPago) })}
-                    </Text>
+                    {simAvalanche.quitouTudo && (
+                      <Text style={styles.comparisonSubtitle}>
+                        {t('dividas.jurosTotal', { valor: formatarMoeda(simAvalanche.totalJurosPago) })}
+                      </Text>
+                    )}
                     {avalancheEhMaisBarata && <Text style={styles.comparisonBadge}>{t('dividas.maisBarata')}</Text>}
                   </TouchableOpacity>
 
@@ -3686,12 +3757,16 @@ function TelaDividas() {
                     <Text style={styles.comparisonTitle}>{t('dividas.estrategiaQuitaRapido')}</Text>
                     <Text style={styles.comparisonValue}>
                       {simBolaDeNeve.quitouTudo
-                        ? t('dividas.resultadoMeses', { meses: simBolaDeNeve.meses })
+                        ? simBolaDeNeve.meses === 1
+                          ? t('dividas.resultadoUmMes')
+                          : t('dividas.resultadoMeses', { meses: simBolaDeNeve.meses })
                         : t('dividas.naoQuitaAssim')}
                     </Text>
-                    <Text style={styles.comparisonSubtitle}>
-                      {t('dividas.jurosTotal', { valor: formatarMoeda(simBolaDeNeve.totalJurosPago) })}
-                    </Text>
+                    {simBolaDeNeve.quitouTudo && (
+                      <Text style={styles.comparisonSubtitle}>
+                        {t('dividas.jurosTotal', { valor: formatarMoeda(simBolaDeNeve.totalJurosPago) })}
+                      </Text>
+                    )}
                     {!avalancheEhMaisBarata && <Text style={styles.comparisonBadge}>{t('dividas.maisBarata')}</Text>}
                   </TouchableOpacity>
                 </View>
@@ -4893,8 +4968,8 @@ const TRADUCOES = {
       esqueciSenha: 'Esqueci minha senha',
       preenchaEmailESenha: 'Preencha o e-mail e a senha.',
       contaCriada:
-        'Conta criada! Se pedirmos confirmação por e-mail, dá uma olhada na sua caixa de entrada — senão, você já está logado.',
-      digiteEmailPrimeiro: 'Digite seu e-mail ali em cima e toque em "Esqueci minha senha" de novo.',
+        'Conta criada! Enviamos um e-mail de confirmação pra você. Abra a mensagem e clique no link pra ativar sua conta — se não achar, olhe também na caixa de spam.',
+      digiteEmailPrimeiro: 'Primeiro digite seu e-mail no campo acima, depois use o "Esqueci minha senha" de novo.',
       linkEnviado: 'Se esse e-mail tiver uma conta, enviamos um link pra redefinir a senha. Confira sua caixa de entrada.',
       semConexao: 'Não foi possível conectar. Verifique sua internet e tente de novo.',
       novaSenhaTitulo: 'Escolher nova senha',
@@ -4928,7 +5003,7 @@ const TRADUCOES = {
     dividas: {
       saldoDevedor: 'Saldo devedor',
       juros: 'Juros',
-      taxaAoMesLinha: '{{taxa}}% a.m. ({{valorJuros}}/mês)',
+      taxaAoMesLinha: '{{taxa}}% ao mês ({{valorJuros}}/mês)',
       valorParcela: 'Valor da parcela',
       parcelaMinima: 'Parcela mínima',
       parcelasPagas: 'Parcelas pagas',
@@ -4936,7 +5011,7 @@ const TRADUCOES = {
       dividaQuitada: '🎉 Dívida quitada',
       parcelaPagaEsteMes: '✅ Parcela deste mês já paga (confirme na aba Início)',
       parcelaPendenteEsteMes: '⏳ Parcela deste mês ainda pendente (confirme na aba Início)',
-      avisoJurosAltos: 'A parcela não cobre nem os juros do mês — essa dívida só cresce assim.',
+      avisoJurosAltos: 'A parcela não cobre nem os juros do mês. Pagando só isso, essa dívida aumenta em vez de diminuir.',
       focoAgora: 'Foco agora',
       confirmarRemocaoTitulo: 'Remover dívida',
       confirmarRemocaoMensagem: 'Tem certeza que quer remover essa dívida da lista?',
@@ -4944,6 +5019,8 @@ const TRADUCOES = {
       erroSaldo: 'O saldo devedor precisa ser maior que zero.',
       erroParcela: 'A parcela mínima precisa ser maior que zero.',
       erroNumeroParcelas: 'O número de parcelas precisa ser maior que zero (ou deixe em branco se não for parcelado, tipo cartão de crédito).',
+      erroValorAlto: 'Esse valor está alto demais. Confira se não escapou um zero a mais.',
+      erroTaxa: 'A taxa de juros parece alta demais. Digite a taxa MENSAL em % (ex.: 12 para 12% ao mês). Deixe em branco se não souber.',
       carregando: 'Carregando suas dívidas...',
       headerTitulo: 'Minhas Dívidas',
       totalDevido: 'Total devido: {{valor}}',
@@ -4954,8 +5031,9 @@ const TRADUCOES = {
       escolhaEstrategiaHelper: 'Toque em um dos cards pra escolher. Isso muda a ordem de ataque das suas dívidas, logo abaixo.',
       estrategiaMenorJuros: 'Menor Juros',
       estrategiaQuitaRapido: 'Quita Rápido',
-      avisoOrdemIgual: 'Nas suas dívidas de hoje, uma delas tem juntas o menor saldo E o maior juro — por isso as duas estratégias apontam pra mesma ordem de ataque. Isso muda se suas dívidas mudarem.',
+      avisoOrdemIgual: 'Hoje uma das suas dívidas tem, ao mesmo tempo, o menor saldo E o maior juro — por isso as duas estratégias apontam pra mesma ordem. Se suas dívidas mudarem, essa ordem pode mudar também.',
       resultadoMeses: '{{meses}} meses',
+      resultadoUmMes: '1 mês',
       naoQuitaAssim: 'não quita assim',
       jurosTotal: 'Juros total: {{valor}}',
       maisBarata: '💰 Mais barata',
@@ -5019,7 +5097,7 @@ const TRADUCOES = {
       alocacaoLinha: '{{percentual}}% · {{valor}}',
       reservaTitulo: 'Reserva de emergência',
       reservaHelper: 'A recomendação clássica é ter de 3 a 6 meses das suas despesas fixas guardados, pra imprevistos (perder o emprego, um conserto caro, etc). Aqui a meta usa 6 meses. Marque um investimento como "Reserva de Emergência" pra ele contar aqui.',
-      reservaProgressoLabel: '{{progresso}}% da meta (6x {{valor}}/mês)',
+      reservaProgressoLabel: '{{progresso}}% da meta (6 meses de {{valor}})',
       reservaSemContasFixas: 'Cadastre suas contas fixas de saída na aba Início pra calcular sua meta de reserva.',
       metasTitulo: 'Metas de economia',
       metasHelper: 'Crie uma meta com um valor e, se quiser, uma data. O app calcula quanto guardar por mês pra chegar lá.',
@@ -5031,10 +5109,11 @@ const TRADUCOES = {
       comparadorTitulo: 'Investir ou quitar dívida primeiro?',
       comparadorHelper: 'Toda dívida com juros é um "investimento garantido ao contrário": quitá-la rende, com certeza, a taxa de juros que ela cobra. Compare isso com o quanto você espera que seus investimentos rendam por ano.',
       retornoEsperadoLabel: 'Retorno esperado dos seus investimentos (% ao ano)',
+      retornoEsperadoSimuladorLabel: 'Quanto você espera que esse dinheiro renda por ano (%)',
       retornoEsperadoHelper: 'Ninguém sabe esse número ao certo (investimento não tem garantia) — coloque uma estimativa sua, só pra comparar.',
       placeholderTaxa: 'Ex: 10',
       comparadorResultTitulo: '{{nome}} custa ~{{taxa}}% ao ano',
-      comparadorResultQuitar: 'Quitar essa dívida "rende" {{diferenca}} pontos a mais, garantido, do que sua expectativa de investimento. Quase sempre compensa mais priorizar quitar essa dívida primeiro.',
+      comparadorResultQuitar: 'Quitar essa dívida rende {{diferenca}}% ao ano a mais que a sua expectativa de investimento — e sem risco nenhum. Quase sempre vale mais a pena quitar ela primeiro.',
       comparadorResultInvestir: 'Seus investimentos podem render mais do que essa dívida custa. Ainda assim, lembre que investimento não tem garantia — e a dívida, se não for paga, com certeza continua cobrando juros.',
       simuladorTitulo: 'Quanto você pode ter no futuro?',
       simuladorHelper: 'Com base no que você já tem investido ({{valor}}) e supondo que você continue aportando todo mês, veja uma estimativa (sem garantia nenhuma — é só uma projeção) de quanto isso pode virar com o tempo.',
@@ -5071,7 +5150,7 @@ const TRADUCOES = {
       erroValor: 'O valor precisa ser maior que zero.',
       erroNumeroParcelasCompra: 'Digite em quantas vezes foi parcelado (2 ou mais).',
       erroNomeContaFixa: 'Digite um nome pra essa conta fixa.',
-      erroDiaContaFixa: 'Digite um dia do mês entre 1 e 28 (pra funcionar em qualquer mês, até fevereiro).',
+      erroDiaContaFixa: 'Digite um dia do mês entre 1 e 28 — assim funciona em todos os meses, inclusive fevereiro.',
       confirmarRemocaoContaFixaTitulo: 'Remover conta fixa',
       confirmarRemocaoContaFixaMensagem: 'Tem certeza? Isso não apaga as transações que já foram lançadas antes, só para de lembrar você dela.',
       aindaNaoEntrouNoSaldo: 'ainda não entrou no saldo',
@@ -5087,7 +5166,7 @@ const TRADUCOES = {
       jaEstourouOMes: 'Já estourou o mês',
       gastoDiarioVerde: 'Tá tranquilo — dentro do esperado pro resto do mês.',
       gastoDiarioAmarelo: 'Atenção: seu ritmo de gasto tá acima do que dá pra sustentar até o fim do mês.',
-      gastoDiarioVermelho: 'Você já comprometeu tudo (ou mais) do que tinha disponível esse mês.',
+      gastoDiarioVermelho: 'Você já comprometeu tudo (ou mais) do que tinha disponível este mês.',
       mesForaPadraoMais: 'Mês fora do padrão: gastando mais',
       mesForaPadraoMenos: 'Mês fora do padrão: gastando menos',
       alertaMesTextoMais: 'Você já gastou {{total}} até hoje, {{percentual}}% a mais que o normal (média de {{media}} até esse mesmo dia).',
@@ -5133,11 +5212,11 @@ const TRADUCOES = {
       parcelaDeValor: 'Parcela de {{valor}}',
       xDeYPagas: '{{pagas}} de {{total}} pagas',
       xPagas: '{{pagas}} pagas',
+      nenhumaPaga: 'nenhuma paga ainda',
       maquinaDoTempo: 'Máquina do Tempo',
-      maquinaDoTempoVazio: 'Ainda não tenho pelo menos 1 mês fechado de histórico pra fazer uma projeção. Continue registrando suas transações!',
-      mediaDosUltimosMeses: 'Nos últimos {{meses}} {{mesOuMeses}}, sua média foi de {{sobraOuDeficit}} de {{valor}} por mês.',
-      mes: 'mês',
-      meses: 'meses',
+      maquinaDoTempoVazio: 'Ainda não há pelo menos 1 mês fechado no histórico pra fazer uma projeção. Continue registrando suas transações!',
+      mediaDoUltimoMes: 'No último mês, sua média foi de {{sobraOuDeficit}} de {{valor}} por mês.',
+      mediaDosUltimosMeses: 'Nos últimos {{meses}} meses, sua média foi de {{sobraOuDeficit}} de {{valor}} por mês.',
       umaSobra: 'uma sobra',
       umDeficit: 'um déficit',
       seContinuarNesseRitmo: 'Se continuar nesse ritmo:',
@@ -5218,8 +5297,8 @@ const TRADUCOES = {
       esqueciSenha: 'I forgot my password',
       preenchaEmailESenha: 'Fill in your email and password.',
       contaCriada:
-        'Account created! If we ask you to confirm by email, take a look at your inbox — otherwise, you are already signed in.',
-      digiteEmailPrimeiro: 'Type your email up there and tap "I forgot my password" again.',
+        'Account created! We sent you a confirmation email. Open it and click the link to activate your account — if you cannot find it, check your spam folder too.',
+      digiteEmailPrimeiro: 'First type your email in the field above, then use "I forgot my password" again.',
       linkEnviado: 'If that email has an account, we sent a link to reset the password. Check your inbox.',
       semConexao: "Couldn't connect. Check your internet and try again.",
       novaSenhaTitulo: 'Choose a new password',
@@ -5259,7 +5338,7 @@ const TRADUCOES = {
       dividaQuitada: '🎉 Debt paid off',
       parcelaPagaEsteMes: "✅ This month's installment already paid (confirm on the Home tab)",
       parcelaPendenteEsteMes: "⏳ This month's installment still pending (confirm on the Home tab)",
-      avisoJurosAltos: "The installment doesn't even cover the month's interest — this debt will only keep growing.",
+      avisoJurosAltos: "The installment doesn't even cover this month's interest. Paying only that, this debt grows instead of shrinking.",
       focoAgora: 'Focus now',
       confirmarRemocaoTitulo: 'Remove debt',
       confirmarRemocaoMensagem: 'Are you sure you want to remove this debt from the list?',
@@ -5267,6 +5346,8 @@ const TRADUCOES = {
       erroSaldo: 'The outstanding balance needs to be greater than zero.',
       erroParcela: 'The minimum payment needs to be greater than zero.',
       erroNumeroParcelas: "The number of installments needs to be greater than zero (or leave it blank if it's not installment-based, like a credit card).",
+      erroValorAlto: 'That amount is too high. Double-check you didn\'t add an extra zero.',
+      erroTaxa: 'That interest rate looks too high. Enter the MONTHLY rate in % (e.g. 12 for 12% per month). Leave it blank if you\'re not sure.',
       carregando: 'Loading your debts...',
       headerTitulo: 'My Debts',
       totalDevido: 'Total owed: {{valor}}',
@@ -5277,8 +5358,9 @@ const TRADUCOES = {
       escolhaEstrategiaHelper: 'Tap one of the cards to choose. This changes the attack order of your debts, right below.',
       estrategiaMenorJuros: 'Lowest Interest',
       estrategiaQuitaRapido: 'Fastest Payoff',
-      avisoOrdemIgual: 'In your current debts, one of them happens to have both the lowest balance AND the highest interest rate — that\'s why both strategies point to the same attack order. This changes if your debts change.',
+      avisoOrdemIgual: 'Right now one of your debts has both the lowest balance AND the highest interest rate — that\'s why both strategies point to the same order. If your debts change, that order may change too.',
       resultadoMeses: '{{meses}} months',
+      resultadoUmMes: '1 month',
       naoQuitaAssim: "won't be paid off this way",
       jurosTotal: 'Total interest: {{valor}}',
       maisBarata: '💰 Cheapest',
@@ -5342,7 +5424,7 @@ const TRADUCOES = {
       alocacaoLinha: '{{percentual}}% · {{valor}}',
       reservaTitulo: 'Emergency fund',
       reservaHelper: 'The classic recommendation is to have 3 to 6 months of your fixed expenses saved up, for emergencies (losing your job, an expensive repair, etc). Here the goal uses 6 months. Mark an investment as "Emergency Fund" for it to count here.',
-      reservaProgressoLabel: '{{progresso}}% of the goal (6x {{valor}}/month)',
+      reservaProgressoLabel: '{{progresso}}% of the goal (6 months of {{valor}})',
       reservaSemContasFixas: 'Register your fixed expenses on the Home tab to calculate your emergency fund goal.',
       metasTitulo: 'Savings goals',
       metasHelper: 'Create a goal with an amount and, if you want, a date. The app calculates how much to save per month to get there.',
@@ -5354,10 +5436,11 @@ const TRADUCOES = {
       comparadorTitulo: 'Invest or pay off debt first?',
       comparadorHelper: 'Every debt with interest is a "guaranteed investment in reverse": paying it off earns you, for sure, the interest rate it charges. Compare that with how much you expect your investments to earn per year.',
       retornoEsperadoLabel: 'Expected return on your investments (% per year)',
+      retornoEsperadoSimuladorLabel: 'How much you expect this money to earn per year (%)',
       retornoEsperadoHelper: "Nobody knows this number for sure (investments aren't guaranteed) — enter your own estimate, just to compare.",
       placeholderTaxa: 'E.g.: 10',
       comparadorResultTitulo: '{{nome}} costs ~{{taxa}}% per year',
-      comparadorResultQuitar: 'Paying off this debt "earns" {{diferenca}} points more, guaranteed, than your investment expectation. It almost always pays off more to prioritize paying off this debt first.',
+      comparadorResultQuitar: 'Paying off this debt earns {{diferenca}}% per year more than what you expect from your investments — with no risk at all. It is almost always worth paying this one off first.',
       comparadorResultInvestir: "Your investments may earn more than this debt costs. Still, remember that investments aren't guaranteed — and the debt, if left unpaid, will definitely keep charging interest.",
       simuladorTitulo: 'How much could you have in the future?',
       simuladorHelper: "Based on what you already have invested ({{valor}}) and assuming you keep contributing every month, see an estimate (no guarantee at all — it's just a projection) of how much that could turn into over time.",
@@ -5394,7 +5477,7 @@ const TRADUCOES = {
       erroValor: 'The amount needs to be greater than zero.',
       erroNumeroParcelasCompra: 'Enter the number of installments (2 or more).',
       erroNomeContaFixa: 'Enter a name for this fixed expense.',
-      erroDiaContaFixa: 'Enter a day of the month between 1 and 28 (to work in any month, even February).',
+      erroDiaContaFixa: 'Enter a day of the month between 1 and 28 — that way it works in every month, February included.',
       confirmarRemocaoContaFixaTitulo: 'Remove fixed expense',
       confirmarRemocaoContaFixaMensagem: "Are you sure? This won't delete transactions already recorded before, it just stops reminding you about it.",
       aindaNaoEntrouNoSaldo: "hasn't affected the balance yet",
@@ -5456,11 +5539,11 @@ const TRADUCOES = {
       parcelaDeValor: 'Installment of {{valor}}',
       xDeYPagas: '{{pagas}} of {{total}} paid',
       xPagas: '{{pagas}} paid',
+      nenhumaPaga: 'none paid yet',
       maquinaDoTempo: 'Time Machine',
-      maquinaDoTempoVazio: "I don't have at least 1 closed month of history yet to make a projection. Keep recording your transactions!",
-      mediaDosUltimosMeses: 'Over the last {{meses}} {{mesOuMeses}}, your average was {{sobraOuDeficit}} of {{valor}} per month.',
-      mes: 'month',
-      meses: 'months',
+      maquinaDoTempoVazio: "There isn't at least 1 closed month in your history yet to make a projection. Keep recording your transactions!",
+      mediaDoUltimoMes: 'Over the last month, your average was {{sobraOuDeficit}} of {{valor}} per month.',
+      mediaDosUltimosMeses: 'Over the last {{meses}} months, your average was {{sobraOuDeficit}} of {{valor}} per month.',
       umaSobra: 'a surplus',
       umDeficit: 'a deficit',
       seContinuarNesseRitmo: 'If you keep up this pace:',
@@ -5541,8 +5624,8 @@ const TRADUCOES = {
       esqueciSenha: 'Olvidé mi contraseña',
       preenchaEmailESenha: 'Completa el correo y la contraseña.',
       contaCriada:
-        '¡Cuenta creada! Si te pedimos confirmación por correo, échale un ojo a tu bandeja de entrada — si no, ya estás dentro.',
-      digiteEmailPrimeiro: 'Escribe tu correo ahí arriba y toca "Olvidé mi contraseña" de nuevo.',
+        '¡Cuenta creada! Te enviamos un correo de confirmación. Ábrelo y haz clic en el enlace para activar tu cuenta — si no lo encuentras, revisa también la carpeta de spam.',
+      digiteEmailPrimeiro: 'Primero escribe tu correo en el campo de arriba y después usa "Olvidé mi contraseña" de nuevo.',
       linkEnviado: 'Si ese correo tiene una cuenta, te enviamos un enlace para restablecer la contraseña. Revisa tu bandeja de entrada.',
       semConexao: 'No fue posible conectar. Revisa tu internet e inténtalo de nuevo.',
       novaSenhaTitulo: 'Elegir contraseña nueva',
@@ -5582,7 +5665,7 @@ const TRADUCOES = {
       dividaQuitada: '🎉 Deuda saldada',
       parcelaPagaEsteMes: '✅ Cuota de este mes ya pagada (confirma en la pestaña Inicio)',
       parcelaPendenteEsteMes: '⏳ Cuota de este mes aún pendiente (confirma en la pestaña Inicio)',
-      avisoJurosAltos: 'La cuota ni siquiera cubre los intereses del mes — esta deuda solo va a crecer así.',
+      avisoJurosAltos: 'La cuota ni siquiera cubre los intereses del mes. Pagando solo eso, esta deuda crece en vez de bajar.',
       focoAgora: 'Prioridad ahora',
       confirmarRemocaoTitulo: 'Eliminar deuda',
       confirmarRemocaoMensagem: '¿Estás seguro de que quieres eliminar esta deuda de la lista?',
@@ -5590,6 +5673,8 @@ const TRADUCOES = {
       erroSaldo: 'El saldo pendiente debe ser mayor que cero.',
       erroParcela: 'La cuota mínima debe ser mayor que cero.',
       erroNumeroParcelas: 'El número de cuotas debe ser mayor que cero (o déjalo en blanco si no tiene un número fijo, como una tarjeta de crédito).',
+      erroValorAlto: 'Ese monto es demasiado alto. Revisa que no se haya colado un cero de más.',
+      erroTaxa: 'La tasa de interés parece demasiado alta. Escribe la tasa MENSUAL en % (ej.: 12 para 12% al mes). Déjala en blanco si no la sabes.',
       carregando: 'Cargando tus deudas...',
       headerTitulo: 'Mis Deudas',
       totalDevido: 'Total adeudado: {{valor}}',
@@ -5600,8 +5685,9 @@ const TRADUCOES = {
       escolhaEstrategiaHelper: 'Toca una de las tarjetas para elegir. Esto cambia el orden de ataque de tus deudas, justo abajo.',
       estrategiaMenorJuros: 'Menor Interés',
       estrategiaQuitaRapido: 'Salda Rápido',
-      avisoOrdemIgual: 'En tus deudas de hoy, una de ellas tiene a la vez el saldo más bajo Y el interés más alto — por eso las dos estrategias apuntan al mismo orden de ataque. Esto cambia si tus deudas cambian.',
+      avisoOrdemIgual: 'Hoy una de tus deudas tiene, a la vez, el saldo más bajo Y el interés más alto — por eso las dos estrategias apuntan al mismo orden. Si tus deudas cambian, ese orden puede cambiar también.',
       resultadoMeses: '{{meses}} meses',
+      resultadoUmMes: '1 mes',
       naoQuitaAssim: 'no se salda así',
       jurosTotal: 'Interés total: {{valor}}',
       maisBarata: '💰 Más barata',
@@ -5665,7 +5751,7 @@ const TRADUCOES = {
       alocacaoLinha: '{{percentual}}% · {{valor}}',
       reservaTitulo: 'Fondo de emergencia',
       reservaHelper: 'La recomendación clásica es tener de 3 a 6 meses de tus gastos fijos ahorrados, para imprevistos (perder el empleo, una reparación cara, etc). Aquí la meta usa 6 meses. Marca una inversión como "Fondo de Emergencia" para que cuente aquí.',
-      reservaProgressoLabel: '{{progresso}}% de la meta (6x {{valor}}/mes)',
+      reservaProgressoLabel: '{{progresso}}% de la meta (6 meses de {{valor}})',
       reservaSemContasFixas: 'Registra tus gastos fijos en la pestaña Inicio para calcular tu meta de fondo de emergencia.',
       metasTitulo: 'Metas de ahorro',
       metasHelper: 'Crea una meta con un monto y, si quieres, una fecha. La app calcula cuánto ahorrar por mes para llegar.',
@@ -5677,10 +5763,11 @@ const TRADUCOES = {
       comparadorTitulo: '¿Invertir o saldar deuda primero?',
       comparadorHelper: 'Toda deuda con interés es una "inversión garantizada al revés": saldarla rinde, con seguridad, la tasa de interés que cobra. Compara eso con cuánto esperas que tus inversiones rindan por año.',
       retornoEsperadoLabel: 'Rendimiento esperado de tus inversiones (% anual)',
+      retornoEsperadoSimuladorLabel: 'Cuánto esperas que este dinero rinda por año (%)',
       retornoEsperadoHelper: 'Nadie sabe ese número con certeza (invertir no tiene garantía) — pon una estimación tuya, solo para comparar.',
       placeholderTaxa: 'Ej: 10',
       comparadorResultTitulo: '{{nome}} cuesta ~{{taxa}}% anual',
-      comparadorResultQuitar: 'Saldar esta deuda "rinde" {{diferenca}} puntos más, garantizado, que tu expectativa de inversión. Casi siempre conviene más priorizar saldar esta deuda primero.',
+      comparadorResultQuitar: 'Saldar esta deuda rinde {{diferenca}}% al año más que lo que esperas de tus inversiones — y sin ningún riesgo. Casi siempre vale más la pena saldarla primero.',
       comparadorResultInvestir: 'Tus inversiones pueden rendir más de lo que cuesta esta deuda. Aun así, recuerda que invertir no tiene garantía — y la deuda, si no se paga, seguro que sigue generando intereses.',
       simuladorTitulo: '¿Cuánto podrías tener en el futuro?',
       simuladorHelper: 'Con base en lo que ya tienes invertido ({{valor}}) y suponiendo que sigas aportando cada mes, mira una estimación (sin ninguna garantía — es solo una proyección) de en cuánto podría convertirse con el tiempo.',
@@ -5779,11 +5866,11 @@ const TRADUCOES = {
       parcelaDeValor: 'Cuota de {{valor}}',
       xDeYPagas: '{{pagas}} de {{total}} pagadas',
       xPagas: '{{pagas}} pagadas',
+      nenhumaPaga: 'ninguna pagada todavía',
       maquinaDoTempo: 'Máquina del Tiempo',
-      maquinaDoTempoVazio: 'Todavía no tengo al menos 1 mes cerrado de historial para hacer una proyección. ¡Sigue registrando tus transacciones!',
-      mediaDosUltimosMeses: 'En los últimos {{meses}} {{mesOuMeses}}, tu promedio fue de {{sobraOuDeficit}} de {{valor}} por mes.',
-      mes: 'mes',
-      meses: 'meses',
+      maquinaDoTempoVazio: 'Todavía no hay al menos 1 mes cerrado en el historial para hacer una proyección. ¡Sigue registrando tus transacciones!',
+      mediaDoUltimoMes: 'En el último mes, tu promedio fue de {{sobraOuDeficit}} de {{valor}} por mes.',
+      mediaDosUltimosMeses: 'En los últimos {{meses}} meses, tu promedio fue de {{sobraOuDeficit}} de {{valor}} por mes.',
       umaSobra: 'un excedente',
       umDeficit: 'un déficit',
       seContinuarNesseRitmo: 'Si sigues a este ritmo:',
