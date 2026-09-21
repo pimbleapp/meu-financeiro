@@ -1151,6 +1151,14 @@ function diaAnterior(dataISO) {
   return dataParaISO(data);
 }
 
+// A14: data alvo padrão de uma nova meta = 6 meses à frente de hoje. Antes
+// o padrão era HOJE, então toda meta nova já nascia com "faltam 1 mês" e
+// pedindo pra guardar o valor inteiro em 30 dias — assustador e irreal pra
+// quem tá começando. 6 meses é um prazo neutro e mais realista de partida.
+function dataAlvoPadraoMeta(base = new Date()) {
+  return new Date(base.getFullYear(), base.getMonth() + 6, base.getDate());
+}
+
 // "Máquina do Tempo": olha só pra meses JÁ FECHADOS (antes do mês atual),
 // pega no máximo os 3 últimos, e tira a média de quanto sobrou (ou faltou)
 // por mês. É essa média que usamos pra projetar os próximos meses.
@@ -1179,6 +1187,27 @@ function calcularProjecaoFinanceira(transacoes, mesAtualChave) {
   };
 }
 
+// Soma o "net" (entradas - saídas) das transações JÁ agendadas pro futuro,
+// dentro dos próximos N meses — na prática, as parcelas futuras de uma
+// compra parcelada ("compra fantasma"). A Máquina do Tempo só usava a média
+// dos meses fechados e IGNORAVA por completo esses compromissos que já estão
+// marcados pra vencer, então ela mentia: mostrava um saldo lá na frente que
+// não descontava as parcelas que a pessoa já sabe que vai pagar. Como são
+// transações com data no futuro (dataISO > hoje), elas não estão nem no
+// saldoTotal nem na média histórica — somar aqui não duplica nada.
+// (Contas fixas e parcelas de dívida recorrentes continuam representadas
+// pela média histórica; dívidas recém-criadas sem histórico ainda ficam de
+// fora, por não existirem como transações futuras agendadas.)
+function somarNetTransacoesFuturas(transacoes, hojeISO, mesesAFrente) {
+  const [ano, mes, dia] = hojeISO.split('-').map(Number);
+  const limiteISO = dataParaISO(new Date(ano, mes - 1 + mesesAFrente, dia));
+  return arredondar2(
+    transacoes
+      .filter((t) => t.dataISO > hojeISO && t.dataISO <= limiteISO)
+      .reduce((soma, t) => soma + (t.tipo === 'entrada' ? t.valor : -t.valor), 0)
+  );
+}
+
 // "Posso comprar isso?" — simula, sem salvar nada, o que aconteceria com o
 // semáforo do "quanto posso gastar hoje" se você fizesse essa compra à
 // vista agora. Usa a mesma conta do semáforo de verdade, só que descontando
@@ -1190,6 +1219,49 @@ function calcularImpactoCompra(valorCompra, { saldoLivreHoje, diasRestantesNoMes
   if (novoSaldoLivreHoje <= 0) novoStatus = 'vermelho';
   else if (novoGastoDiarioSeguro < mediaGastoDiarioAteAgora) novoStatus = 'amarelo';
   return { novoSaldoLivreHoje, novoGastoDiarioSeguro, novoStatus };
+}
+
+// "Quanto posso gastar hoje" — junta o que já entrou/saiu no mês com o que
+// ainda está PREVISTO acontecer, pros DOIS lados: entradas pendentes (ex.:
+// salário ainda não confirmado) SOMAM, e saídas pendentes (contas fixas e
+// parcelas de dívida) DESCONTAM. Antes só as saídas pendentes eram
+// descontadas e as entradas pendentes eram ignoradas — por isso uma conta
+// nova com salário + aluguel cadastrados aparecia "no vermelho / já estourou
+// o mês" mesmo com renda MAIOR que a despesa. Também devolve "temRenda": sem
+// nenhuma renda conhecida no mês (conta vazia), não dá pra dizer quanto
+// gastar — e principalmente NÃO faz sentido gritar "já estourou o mês" pra
+// quem ainda não gastou nada.
+function calcularGastarHoje({
+  totalEntradas,
+  totalSaidas,
+  entradasFixasPendentesValor,
+  saidasFixasPendentesValor,
+  parcelasDividasPendentesValor,
+  diasRestantesNoMes,
+  mediaGastoDiarioAteAgora,
+}) {
+  const saldoLivreHoje = arredondar2(
+    totalEntradas +
+      entradasFixasPendentesValor -
+      totalSaidas -
+      saidasFixasPendentesValor -
+      parcelasDividasPendentesValor
+  );
+  const gastoDiarioSeguro = arredondar2(saldoLivreHoje / Math.max(1, diasRestantesNoMes));
+  // "Renda conhecida" = já entrou algo esse mês OU tem entrada fixa prevista.
+  const temRenda = totalEntradas + entradasFixasPendentesValor > 0;
+
+  let status;
+  if (!temRenda) {
+    status = 'neutro'; // conta sem renda cadastrada: estado neutro, sem alarme falso
+  } else if (saldoLivreHoje <= 0) {
+    status = 'vermelho';
+  } else if (gastoDiarioSeguro < mediaGastoDiarioAteAgora) {
+    status = 'amarelo';
+  } else {
+    status = 'verde';
+  }
+  return { saldoLivreHoje, gastoDiarioSeguro, temRenda, status };
 }
 
 // "Alerta de mês estranho" — compara o quanto você já gastou esse mês (até
@@ -1404,21 +1476,30 @@ function TelaInicio() {
   const saidasFixasPendentesValor = contasFixas
     .filter((c) => c.tipo === 'saida' && c.ultimoMesConfirmado !== mesAtualChave)
     .reduce((soma, c) => soma + c.valor, 0);
+  // Entradas fixas ainda não confirmadas (ex.: salário do mês). Antes elas
+  // não entravam na conta, então a renda prevista sumia e o card mentia.
+  const entradasFixasPendentesValor = contasFixas
+    .filter((c) => c.tipo === 'entrada' && c.ultimoMesConfirmado !== mesAtualChave)
+    .reduce((soma, c) => soma + c.valor, 0);
   const parcelasDividasPendentesValor = dividasAtivas
     .filter((d) => d.ultimoMesConfirmado !== mesAtualChave)
     .reduce((soma, d) => soma + d.parcelaMinima, 0);
-  const saldoLivreHoje = arredondar2(
-    totalEntradas - totalSaidas - saidasFixasPendentesValor - parcelasDividasPendentesValor
-  );
-  const gastoDiarioSeguro = arredondar2(saldoLivreHoje / Math.max(1, diasRestantesNoMes));
   const mediaGastoDiarioAteAgora = diaDeHoje > 0 ? totalSaidas / diaDeHoje : 0;
 
-  let statusGastoDiario = 'verde';
-  if (saldoLivreHoje <= 0) {
-    statusGastoDiario = 'vermelho';
-  } else if (gastoDiarioSeguro < mediaGastoDiarioAteAgora) {
-    statusGastoDiario = 'amarelo';
-  }
+  const {
+    saldoLivreHoje,
+    gastoDiarioSeguro,
+    temRenda: temRendaConhecida,
+    status: statusGastoDiario,
+  } = calcularGastarHoje({
+    totalEntradas,
+    totalSaidas,
+    entradasFixasPendentesValor,
+    saidasFixasPendentesValor,
+    parcelasDividasPendentesValor,
+    diasRestantesNoMes,
+    mediaGastoDiarioAteAgora,
+  });
 
   // ---- "Posso comprar isso?" ----
   const valorCompraTeste = paraNumero(valorTesteCompra);
@@ -1484,11 +1565,16 @@ function TelaInicio() {
   // ---- "Máquina do Tempo" ----
   // Projeta o saldo lá na frente com base na média dos últimos meses.
   const projecaoFinanceira = calcularProjecaoFinanceira(transacoesJaOcorridas, mesAtualChave);
+  // Além da média histórica, desconta/soma as parcelas futuras já agendadas
+  // (compras parceladas) que caem dentro da janela projetada — senão a
+  // projeção ignoraria dinheiro que a pessoa já sabe que vai pagar.
+  const netFuturo3Meses = somarNetTransacoesFuturas(transacoes, hojeISO, 3);
+  const netFuturo6Meses = somarNetTransacoesFuturas(transacoes, hojeISO, 6);
   const saldoProjetado3Meses = projecaoFinanceira
-    ? arredondar2(saldoTotal + projecaoFinanceira.mediaMensal * 3)
+    ? arredondar2(saldoTotal + projecaoFinanceira.mediaMensal * 3 + netFuturo3Meses)
     : null;
   const saldoProjetado6Meses = projecaoFinanceira
-    ? arredondar2(saldoTotal + projecaoFinanceira.mediaMensal * 6)
+    ? arredondar2(saldoTotal + projecaoFinanceira.mediaMensal * 6 + netFuturo6Meses)
     : null;
 
   // Agrupa as transações por mês, pra mostrar separadores no histórico
@@ -1496,6 +1582,30 @@ function TelaInicio() {
   const secoesTransacoes = agruparTransacoesPorMes(transacoes, t);
 
   function confirmarRemocao(id) {
+    const alvo = transacoes.find((tr) => tr.id === id);
+    const idCompra = alvo && alvo.compraParceladaId;
+    const irmas = idCompra ? transacoes.filter((tr) => tr.compraParceladaId === idCompra) : [];
+
+    // A8: apagar UMA parcela isolada deixava a sequência quebrada (1/6, 2/6,
+    // 4/6...) e um "total" mentiroso. Uma compra parcelada é uma coisa só, então
+    // remover qualquer parcela remove a compra inteira — sem buraco na sequência.
+    if (irmas.length > 1) {
+      avisar(
+        t('inicio.removerCompraParceladaTitulo'),
+        t('inicio.removerCompraParceladaMensagem', { total: irmas.length }),
+        [
+          { text: t('comum.cancelar'), style: 'cancel' },
+          {
+            text: t('inicio.removerCompraToda'),
+            style: 'destructive',
+            onPress: () =>
+              setTransacoes((atual) => atual.filter((tr) => tr.compraParceladaId !== idCompra)),
+          },
+        ]
+      );
+      return;
+    }
+
     avisar(t('inicio.confirmarRemocaoTransacaoTitulo'), t('inicio.confirmarRemocaoTransacaoMensagem'), [
       { text: t('comum.cancelar'), style: 'cancel' },
       {
@@ -1842,7 +1952,9 @@ function TelaInicio() {
         <TouchableOpacity
           onPress={() => confirmarRemocao(item.id)}
           hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-          style={{ marginLeft: 8 }}
+          // A13: padding real (não só hitSlop, que o web ignora) pra o alvo
+          // de toque da lixeira chegar perto dos ~40px recomendados.
+          style={{ marginLeft: 2, padding: 10 }}
         >
           <Ionicons name="trash-outline" size={18} color={cores.textoMuted} />
         </TouchableOpacity>
@@ -1912,6 +2024,7 @@ function TelaInicio() {
       <View
         style={[
           styles.dailyBudgetCard,
+          statusGastoDiario === 'neutro' && styles.dailyBudgetCardNeutro,
           statusGastoDiario === 'verde' && styles.dailyBudgetCardVerde,
           statusGastoDiario === 'amarelo' && styles.dailyBudgetCardAmarelo,
           statusGastoDiario === 'vermelho' && styles.dailyBudgetCardVermelho,
@@ -1919,9 +2032,16 @@ function TelaInicio() {
       >
         <Text style={styles.dailyBudgetLabel}>{t('inicio.quantoPossoGastarHoje')}</Text>
         <Text style={styles.dailyBudgetValue}>
-          {saldoLivreHoje <= 0 ? t('inicio.jaEstourouOMes') : formatarMoeda(gastoDiarioSeguro)}
+          {/* Sem renda conhecida: mostra "—" em vez de acusar estouro; com
+              renda mas saldo <= 0: "já estourou"; senão o valor por dia. */}
+          {!temRendaConhecida
+            ? '—'
+            : saldoLivreHoje <= 0
+            ? t('inicio.jaEstourouOMes')
+            : formatarMoeda(gastoDiarioSeguro)}
         </Text>
         <Text style={styles.dailyBudgetSubtitle}>
+          {statusGastoDiario === 'neutro' && t('inicio.gastoDiarioNeutro')}
           {statusGastoDiario === 'verde' && t('inicio.gastoDiarioVerde')}
           {statusGastoDiario === 'amarelo' && t('inicio.gastoDiarioAmarelo')}
           {statusGastoDiario === 'vermelho' && t('inicio.gastoDiarioVermelho')}
@@ -2063,6 +2183,9 @@ function TelaInicio() {
           {previaTesteCompra.rendaFixaMensal <= 0 && (
             <Text style={styles.helperText}>{t('inicio.cadastreRendaFixa')}</Text>
           )}
+          {/* A6: a prévia divide o total pelas parcelas sem juros. Sem esse
+              aviso, parcelar em mais vezes parecia sempre "mais verde"/melhor. */}
+          <Text style={styles.helperText}>{t('inicio.avisoParcelamentoSemJuros')}</Text>
         </View>
       )}
 
@@ -2173,7 +2296,8 @@ function TelaInicio() {
               <TouchableOpacity
                 onPress={() => removerContaFixa(c.id)}
                 hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                style={{ marginLeft: 12 }}
+                // A13: padding real amplia o alvo de toque (web ignora hitSlop)
+                style={{ marginLeft: 6, padding: 8 }}
               >
                 <Ionicons name="trash-outline" size={18} color={cores.textoMuted} />
               </TouchableOpacity>
@@ -2363,7 +2487,15 @@ function TelaInicio() {
               }
             />
 
-            <Text style={styles.inputLabel}>{t('inicio.valorReais')}</Text>
+            {/* A12: numa compra parcelada, deixa claro que esse valor é o
+                TOTAL da compra (a gente divide nas parcelas), não o valor de
+                cada parcela. */}
+            <Text style={styles.inputLabel}>
+              {compraParcelada && novoTipo === 'saida' ? t('inicio.valorTotalReais') : t('inicio.valorReais')}
+            </Text>
+            {compraParcelada && novoTipo === 'saida' && (
+              <Text style={styles.helperText}>{t('inicio.helperValorTotalParcelado')}</Text>
+            )}
             <TextInput
               style={styles.input}
               value={novoValor}
@@ -2431,6 +2563,9 @@ function TelaInicio() {
                         {previaParcelamento.rendaFixaMensal <= 0 && (
                           <Text style={styles.helperText}>{t('inicio.cadastreRendaFixa')}</Text>
                         )}
+                        {/* A6: mesmo aviso da calculadora — a prévia assume
+                            parcelamento sem juros. */}
+                        <Text style={styles.helperText}>{t('inicio.avisoParcelamentoSemJuros')}</Text>
                       </View>
                     )}
                   </>
@@ -2676,7 +2811,11 @@ function CardDivida({ divida, posicao, destaque, onRemover, onEditar }) {
           <Text style={styles.debtName}>{divida.nome}</Text>
           {destaque && !quitada && <Text style={styles.debtFocoLabel}>🎯 {t('dividas.focoAgora')}</Text>}
         </View>
-        <TouchableOpacity onPress={() => onRemover(divida.id)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <TouchableOpacity
+          onPress={() => onRemover(divida.id)}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          style={{ padding: 8 }}
+        >
           <Ionicons name="trash-outline" size={20} color={cores.textoMuted} />
         </TouchableOpacity>
       </View>
@@ -2720,7 +2859,13 @@ function CardDivida({ divida, posicao, destaque, onRemover, onEditar }) {
       {!quitada && alertaJurosAltos && (
         <View style={styles.debtWarningBox}>
           <Ionicons name="warning" size={14} color={cores.ambarTexto} />
-          <Text style={styles.debtWarningText}>{t('dividas.avisoJurosAltos')}</Text>
+          <Text style={styles.debtWarningText}>
+            {/* A10: além de avisar, diz QUAL parcela resolveria — pra abater
+                o saldo, a parcela precisa passar dos juros do mês. */}
+            {t('dividas.avisoJurosAltos', {
+              parcelaMinimaQuita: formatarMoeda(arredondar2(jurosMensal + 0.01)),
+            })}
+          </Text>
         </View>
       )}
     </TouchableOpacity>
@@ -2757,7 +2902,11 @@ function CardInvestimento({ investimento, onRemover, onEditar }) {
             </Text>
           </View>
         </View>
-        <TouchableOpacity onPress={() => onRemover(investimento.id)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <TouchableOpacity
+          onPress={() => onRemover(investimento.id)}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          style={{ padding: 8 }}
+        >
           <Ionicons name="trash-outline" size={20} color={cores.textoMuted} />
         </TouchableOpacity>
       </View>
@@ -2792,7 +2941,11 @@ function CardMeta({ meta, onRemover, onEditar }) {
     <TouchableOpacity style={styles.metaCard} onPress={() => onEditar(meta)} activeOpacity={0.7}>
       <View style={styles.metaCardTopRow}>
         <Text style={styles.metaName}>{meta.nome}</Text>
-        <TouchableOpacity onPress={() => onRemover(meta.id)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <TouchableOpacity
+          onPress={() => onRemover(meta.id)}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          style={{ padding: 8 }}
+        >
           <Ionicons name="trash-outline" size={20} color={cores.textoMuted} />
         </TouchableOpacity>
       </View>
@@ -2914,7 +3067,7 @@ function TelaInvestimentos() {
   const [novoValorAlvoMeta, setNovoValorAlvoMeta] = useState('');
   const [novoValorAtualMeta, setNovoValorAtualMeta] = useState('');
   const [metaTemData, setMetaTemData] = useState(false);
-  const [metaDataSelecionada, setMetaDataSelecionada] = useState(new Date());
+  const [metaDataSelecionada, setMetaDataSelecionada] = useState(dataAlvoPadraoMeta());
   const [mostrarSeletorDataMeta, setMostrarSeletorDataMeta] = useState(false);
 
   const resumo = calcularResumoInvestimentos(investimentos);
@@ -3013,7 +3166,7 @@ function TelaInvestimentos() {
     setNovoValorAlvoMeta('');
     setNovoValorAtualMeta('');
     setMetaTemData(false);
-    setMetaDataSelecionada(new Date());
+    setMetaDataSelecionada(dataAlvoPadraoMeta());
     setMetaEditandoId(null);
   }
 
@@ -3023,7 +3176,7 @@ function TelaInvestimentos() {
     setNovoValorAlvoMeta(String(meta.valorAlvo));
     setNovoValorAtualMeta(String(meta.valorAtual));
     setMetaTemData(!!meta.dataAlvo);
-    setMetaDataSelecionada(meta.dataAlvo ? dataISOParaData(meta.dataAlvo) : new Date());
+    setMetaDataSelecionada(meta.dataAlvo ? dataISOParaData(meta.dataAlvo) : dataAlvoPadraoMeta());
     setModalMetaVisivel(true);
   }
 
@@ -3559,6 +3712,13 @@ function TelaDividas() {
   const simAvalanche = simularQuitacao(ordenarDividas(dividasAtivas, 'avalanche'), extraMensal);
   const simBolaDeNeve = simularQuitacao(ordenarDividas(dividasAtivas, 'bolaDeNeve'), extraMensal);
 
+  // A9: com UMA dívida só não existe "estratégia" (ordem) a comparar, mas o
+  // campo "quanto a mais por mês" continuava lá, inerte, sem mostrar
+  // resultado nenhum. Aqui a gente simula essa única dívida com o extra e
+  // também só com a parcela mínima, pra mostrar o quanto o extra adianta.
+  const simDividaUnicaComExtra = dividasAtivas.length === 1 ? simularQuitacao(dividasAtivas, extraMensal) : null;
+  const simDividaUnicaMinimo = dividasAtivas.length === 1 ? simularQuitacao(dividasAtivas, 0) : null;
+
   const avalancheEhMaisBarata = simAvalanche.totalJurosPago <= simBolaDeNeve.totalJurosPago;
 
   // Às vezes a dívida com o MENOR saldo é também a de MAIOR juros (muito
@@ -3695,9 +3855,11 @@ function TelaDividas() {
 
         {dividasAtivas.length > 0 && (
           <>
-            {/* Valor extra mensal — entra na conta das duas simulações abaixo */}
+            {/* Valor extra mensal — entra na conta das simulações abaixo */}
             <Text style={styles.sectionTitle}>{t('dividas.tituloValorExtra')}</Text>
-            <Text style={styles.helperText}>{t('dividas.helperValorExtra')}</Text>
+            <Text style={styles.helperText}>
+              {dividasAtivas.length > 1 ? t('dividas.helperValorExtra') : t('dividas.helperValorExtraUmaDivida')}
+            </Text>
             <TextInput
               style={styles.input}
               value={valorExtraTexto}
@@ -3705,6 +3867,46 @@ function TelaDividas() {
               keyboardType="decimal-pad"
               placeholder={t('dividas.placeholderValorExtra')}
             />
+
+            {/* A9: com uma dívida só, mostra o resultado da simulação aqui
+                (o campo de extra deixa de ser inerte). */}
+            {dividasAtivas.length === 1 && simDividaUnicaComExtra && (
+              <View style={styles.previaParcelamentoBox}>
+                {simDividaUnicaComExtra.naoQuita ? (
+                  <Text style={styles.previaParcelamentoLinha}>{t('dividas.umaDividaNaoQuita')}</Text>
+                ) : (
+                  <>
+                    <Text style={styles.previaParcelamentoTitulo}>
+                      {simDividaUnicaComExtra.meses === 1
+                        ? t('dividas.umaDividaQuitaUmMes', {
+                            juros: formatarMoeda(simDividaUnicaComExtra.totalJurosPago),
+                          })
+                        : t('dividas.umaDividaQuitaMeses', {
+                            meses: simDividaUnicaComExtra.meses,
+                            juros: formatarMoeda(simDividaUnicaComExtra.totalJurosPago),
+                          })}
+                    </Text>
+                    {/* Compara com pagar só o mínimo, pra mostrar o ganho do extra */}
+                    {extraMensal > 0 &&
+                      simDividaUnicaMinimo &&
+                      !simDividaUnicaMinimo.naoQuita &&
+                      simDividaUnicaMinimo.meses > simDividaUnicaComExtra.meses && (
+                        <Text style={styles.previaParcelamentoLinha}>
+                          {t('dividas.umaDividaEconomia', {
+                            mesesMenos: simDividaUnicaMinimo.meses - simDividaUnicaComExtra.meses,
+                            jurosMenos: formatarMoeda(
+                              arredondar2(simDividaUnicaMinimo.totalJurosPago - simDividaUnicaComExtra.totalJurosPago)
+                            ),
+                          })}
+                        </Text>
+                      )}
+                    {extraMensal > 0 && simDividaUnicaMinimo && simDividaUnicaMinimo.naoQuita && (
+                      <Text style={styles.previaParcelamentoLinha}>{t('dividas.umaDividaSoMinimoNaoQuita')}</Text>
+                    )}
+                  </>
+                )}
+              </View>
+            )}
 
             {/* A comparação de estratégias só faz sentido com 2 ou mais
                 dívidas — com 0 ou 1, não existe "ordem" pra escolher. */}
@@ -5011,7 +5213,7 @@ const TRADUCOES = {
       dividaQuitada: '🎉 Dívida quitada',
       parcelaPagaEsteMes: '✅ Parcela deste mês já paga (confirme na aba Início)',
       parcelaPendenteEsteMes: '⏳ Parcela deste mês ainda pendente (confirme na aba Início)',
-      avisoJurosAltos: 'A parcela não cobre nem os juros do mês. Pagando só isso, essa dívida aumenta em vez de diminuir.',
+      avisoJurosAltos: 'A parcela não cobre nem os juros do mês: pagando só isso, a dívida aumenta em vez de diminuir. Pra começar a abater, a parcela precisa passar de {{parcelaMinimaQuita}}/mês.',
       focoAgora: 'Foco agora',
       confirmarRemocaoTitulo: 'Remover dívida',
       confirmarRemocaoMensagem: 'Tem certeza que quer remover essa dívida da lista?',
@@ -5026,6 +5228,12 @@ const TRADUCOES = {
       totalDevido: 'Total devido: {{valor}}',
       tituloValorExtra: 'Quanto a mais você paga por mês?',
       helperValorExtra: 'Além das parcelas mínimas, esse valor extra é usado nas duas simulações abaixo.',
+      helperValorExtraUmaDivida: 'Além da parcela mínima, esse valor extra é jogado na dívida todo mês — veja abaixo em quanto tempo você quita.',
+      umaDividaQuitaMeses: 'Nesse ritmo você quita essa dívida em {{meses}} meses, pagando {{juros}} de juros no total.',
+      umaDividaQuitaUmMes: 'Nesse ritmo você quita essa dívida em 1 mês, pagando {{juros}} de juros no total.',
+      umaDividaNaoQuita: 'Com esse valor a dívida não quita: a parcela não cobre os juros. Aumente a parcela ou o valor extra.',
+      umaDividaEconomia: 'Com esse extra você quita {{mesesMenos}} meses antes e economiza {{jurosMenos}} de juros, comparado a pagar só o mínimo.',
+      umaDividaSoMinimoNaoQuita: 'Pagando só a parcela mínima (sem o extra), essa dívida nunca quitaria.',
       placeholderValorExtra: 'Ex: 300',
       escolhaEstrategia: 'Escolha sua estratégia',
       escolhaEstrategiaHelper: 'Toque em um dos cards pra escolher. Isso muda a ordem de ataque das suas dívidas, logo abaixo.',
@@ -5144,6 +5352,9 @@ const TRADUCOES = {
       helperDataMeta: 'Com uma data, o app calcula quanto guardar por mês pra chegar lá.',
     },
     inicio: {
+      removerCompraParceladaTitulo: 'Remover compra parcelada',
+      removerCompraParceladaMensagem: 'Essa parcela faz parte de uma compra parcelada em {{total}}x. Pra não deixar a sequência quebrada, vamos remover a compra inteira (todas as parcelas).',
+      removerCompraToda: 'Remover tudo',
       confirmarRemocaoTransacaoTitulo: 'Remover transação',
       confirmarRemocaoTransacaoMensagem: 'Tem certeza que quer remover essa transação?',
       erroDescricao: 'Digite uma descrição pra essa transação.',
@@ -5164,6 +5375,7 @@ const TRADUCOES = {
       esteMes: 'este mês',
       quantoPossoGastarHoje: 'Quanto posso gastar hoje',
       jaEstourouOMes: 'Já estourou o mês',
+      gastoDiarioNeutro: 'Cadastre sua renda (salário como conta fixa de entrada) pra ver quanto dá pra gastar por dia.',
       gastoDiarioVerde: 'Tá tranquilo — dentro do esperado pro resto do mês.',
       gastoDiarioAmarelo: 'Atenção: seu ritmo de gasto tá acima do que dá pra sustentar até o fim do mês.',
       gastoDiarioVermelho: 'Você já comprometeu tudo (ou mais) do que tinha disponível este mês.',
@@ -5184,6 +5396,7 @@ const TRADUCOES = {
       impactoCompraTextoVermelho: 'Depois dessa compra, seu mês fica no vermelho (faltariam {{valor}}).',
       impactoCompraTextoOk: 'Depois dessa compra, ainda sobram {{valor}}/dia pro resto do mês.',
       previaDoImpacto: 'Prévia do impacto:',
+      avisoParcelamentoSemJuros: 'A prévia considera parcelamento sem juros (divide o total pelas parcelas). Se o seu tiver juros, o custo real é maior — e parcelar em mais vezes não deixa mais barato.',
       vaiApertarBastante: 'vai apertar bastante',
       vaiFicarApertado: 'vai ficar apertado',
       tranquilo: 'tranquilo',
@@ -5229,6 +5442,8 @@ const TRADUCOES = {
       placeholderDescricaoEntrada: 'Ex: Salário, Extras, Freelance...',
       placeholderDescricaoSaida: 'Ex: Mercado, Uber, Aluguel...',
       valorReais: 'Valor (R$)',
+      valorTotalReais: 'Valor total da compra (R$)',
+      helperValorTotalParcelado: 'Digite o valor total da compra. A gente divide nas parcelas pra você.',
       placeholderValorTransacao: 'Ex: 150',
       foiParceladoNoCartao: 'Foi parcelado no cartão?',
       helperParcelasFuturas: 'As parcelas futuras já aparecem no histórico, mas só entram no saldo quando a data de cada uma chegar.',
@@ -5338,7 +5553,7 @@ const TRADUCOES = {
       dividaQuitada: '🎉 Debt paid off',
       parcelaPagaEsteMes: "✅ This month's installment already paid (confirm on the Home tab)",
       parcelaPendenteEsteMes: "⏳ This month's installment still pending (confirm on the Home tab)",
-      avisoJurosAltos: "The installment doesn't even cover this month's interest. Paying only that, this debt grows instead of shrinking.",
+      avisoJurosAltos: "The installment doesn't even cover this month's interest: paying only that, the debt grows instead of shrinking. To start paying it down, the installment needs to be more than {{parcelaMinimaQuita}}/month.",
       focoAgora: 'Focus now',
       confirmarRemocaoTitulo: 'Remove debt',
       confirmarRemocaoMensagem: 'Are you sure you want to remove this debt from the list?',
@@ -5353,6 +5568,12 @@ const TRADUCOES = {
       totalDevido: 'Total owed: {{valor}}',
       tituloValorExtra: 'How much extra do you pay per month?',
       helperValorExtra: 'Besides the minimum payments, this extra amount is used in the two simulations below.',
+      helperValorExtraUmaDivida: 'On top of the minimum payment, this extra amount goes toward the debt every month — see below how long until it is paid off.',
+      umaDividaQuitaMeses: 'At this pace you pay off this debt in {{meses}} months, paying {{juros}} in interest total.',
+      umaDividaQuitaUmMes: 'At this pace you pay off this debt in 1 month, paying {{juros}} in interest total.',
+      umaDividaNaoQuita: 'With this amount the debt never gets paid off: the payment does not cover the interest. Increase the payment or the extra amount.',
+      umaDividaEconomia: 'With this extra you finish {{mesesMenos}} months sooner and save {{jurosMenos}} in interest, compared to paying only the minimum.',
+      umaDividaSoMinimoNaoQuita: 'Paying only the minimum (without the extra), this debt would never be paid off.',
       placeholderValorExtra: 'E.g.: 300',
       escolhaEstrategia: 'Choose your strategy',
       escolhaEstrategiaHelper: 'Tap one of the cards to choose. This changes the attack order of your debts, right below.',
@@ -5471,6 +5692,9 @@ const TRADUCOES = {
       helperDataMeta: 'With a date, the app calculates how much to save per month to get there.',
     },
     inicio: {
+      removerCompraParceladaTitulo: 'Remove installment purchase',
+      removerCompraParceladaMensagem: 'This installment is part of a purchase split into {{total}}x. To avoid a broken sequence, we will remove the whole purchase (all installments).',
+      removerCompraToda: 'Remove all',
       confirmarRemocaoTransacaoTitulo: 'Remove transaction',
       confirmarRemocaoTransacaoMensagem: 'Are you sure you want to remove this transaction?',
       erroDescricao: 'Enter a description for this transaction.',
@@ -5491,6 +5715,7 @@ const TRADUCOES = {
       esteMes: 'this month',
       quantoPossoGastarHoje: 'How much can I spend today',
       jaEstourouOMes: 'Already over budget this month',
+      gastoDiarioNeutro: 'Add your income (salary as a recurring bill) to see how much you can spend per day.',
       gastoDiarioVerde: "It's all good — within what's expected for the rest of the month.",
       gastoDiarioAmarelo: "Heads up: your spending pace is above what you can sustain until the end of the month.",
       gastoDiarioVermelho: 'You have already committed all (or more) of what you had available this month.',
@@ -5511,6 +5736,7 @@ const TRADUCOES = {
       impactoCompraTextoVermelho: 'After this purchase, your month goes into the red (you would be short {{valor}}).',
       impactoCompraTextoOk: 'After this purchase, you would still have {{valor}}/day left for the rest of the month.',
       previaDoImpacto: 'Impact preview:',
+      avisoParcelamentoSemJuros: 'This preview assumes interest-free installments (it just splits the total). If yours charges interest, the real cost is higher — and more installments do not make it cheaper.',
       vaiApertarBastante: "it'll get pretty tight",
       vaiFicarApertado: "it'll get a bit tight",
       tranquilo: 'no problem',
@@ -5556,6 +5782,8 @@ const TRADUCOES = {
       placeholderDescricaoEntrada: 'E.g.: Salary, Bonus, Freelance...',
       placeholderDescricaoSaida: 'E.g.: Groceries, Uber, Rent...',
       valorReais: 'Amount ($)',
+      valorTotalReais: 'Total purchase amount ($)',
+      helperValorTotalParcelado: 'Enter the full purchase amount. We split it into installments for you.',
       placeholderValorTransacao: 'E.g.: 150',
       foiParceladoNoCartao: 'Was it a card installment purchase?',
       helperParcelasFuturas: "Future installments already show up in the history, but they only affect the balance once each one's date arrives.",
@@ -5665,7 +5893,7 @@ const TRADUCOES = {
       dividaQuitada: '🎉 Deuda saldada',
       parcelaPagaEsteMes: '✅ Cuota de este mes ya pagada (confirma en la pestaña Inicio)',
       parcelaPendenteEsteMes: '⏳ Cuota de este mes aún pendiente (confirma en la pestaña Inicio)',
-      avisoJurosAltos: 'La cuota ni siquiera cubre los intereses del mes. Pagando solo eso, esta deuda crece en vez de bajar.',
+      avisoJurosAltos: 'La cuota ni siquiera cubre los intereses del mes: pagando solo eso, la deuda crece en vez de bajar. Para empezar a reducirla, la cuota debe superar {{parcelaMinimaQuita}}/mes.',
       focoAgora: 'Prioridad ahora',
       confirmarRemocaoTitulo: 'Eliminar deuda',
       confirmarRemocaoMensagem: '¿Estás seguro de que quieres eliminar esta deuda de la lista?',
@@ -5680,6 +5908,12 @@ const TRADUCOES = {
       totalDevido: 'Total adeudado: {{valor}}',
       tituloValorExtra: '¿Cuánto más pagas por mes?',
       helperValorExtra: 'Además de las cuotas mínimas, este monto extra se usa en las dos simulaciones de abajo.',
+      helperValorExtraUmaDivida: 'Además de la cuota mínima, este monto extra se destina a la deuda cada mes — mira abajo en cuánto tiempo la saldas.',
+      umaDividaQuitaMeses: 'A este ritmo saldas esta deuda en {{meses}} meses, pagando {{juros}} de intereses en total.',
+      umaDividaQuitaUmMes: 'A este ritmo saldas esta deuda en 1 mes, pagando {{juros}} de intereses en total.',
+      umaDividaNaoQuita: 'Con este monto la deuda no se salda: la cuota no cubre los intereses. Aumenta la cuota o el monto extra.',
+      umaDividaEconomia: 'Con este extra terminas {{mesesMenos}} meses antes y ahorras {{jurosMenos}} de intereses, comparado con pagar solo el mínimo.',
+      umaDividaSoMinimoNaoQuita: 'Pagando solo la cuota mínima (sin el extra), esta deuda nunca se saldaría.',
       placeholderValorExtra: 'Ej: 300',
       escolhaEstrategia: 'Elige tu estrategia',
       escolhaEstrategiaHelper: 'Toca una de las tarjetas para elegir. Esto cambia el orden de ataque de tus deudas, justo abajo.',
@@ -5798,6 +6032,9 @@ const TRADUCOES = {
       helperDataMeta: 'Con una fecha, la app calcula cuánto ahorrar por mes para llegar.',
     },
     inicio: {
+      removerCompraParceladaTitulo: 'Eliminar compra en cuotas',
+      removerCompraParceladaMensagem: 'Esta cuota es parte de una compra en {{total}}x. Para no dejar la secuencia rota, eliminaremos la compra completa (todas las cuotas).',
+      removerCompraToda: 'Eliminar todo',
       confirmarRemocaoTransacaoTitulo: 'Eliminar transacción',
       confirmarRemocaoTransacaoMensagem: '¿Estás seguro de que quieres eliminar esta transacción?',
       erroDescricao: 'Escribe una descripción para esta transacción.',
@@ -5818,6 +6055,7 @@ const TRADUCOES = {
       esteMes: 'este mes',
       quantoPossoGastarHoje: 'Cuánto puedo gastar hoy',
       jaEstourouOMes: 'Ya te pasaste del mes',
+      gastoDiarioNeutro: 'Registra tus ingresos (sueldo como cuenta fija de entrada) para ver cuánto puedes gastar por día.',
       gastoDiarioVerde: 'Todo tranquilo — dentro de lo esperado para el resto del mes.',
       gastoDiarioAmarelo: 'Atención: tu ritmo de gasto está por encima de lo que puedes sostener hasta fin de mes.',
       gastoDiarioVermelho: 'Ya comprometiste todo (o más) de lo que tenías disponible este mes.',
@@ -5838,6 +6076,7 @@ const TRADUCOES = {
       impactoCompraTextoVermelho: 'Después de esta compra, tu mes queda en rojo (te faltarían {{valor}}).',
       impactoCompraTextoOk: 'Después de esta compra, todavía te quedan {{valor}}/día para el resto del mes.',
       previaDoImpacto: 'Vista previa del impacto:',
+      avisoParcelamentoSemJuros: 'La vista previa asume cuotas sin intereses (solo divide el total). Si el tuyo tiene intereses, el costo real es mayor — y más cuotas no lo hacen más barato.',
       vaiApertarBastante: 'se va a apretar bastante',
       vaiFicarApertado: 'se va a poner algo justo',
       tranquilo: 'tranquilo',
@@ -5883,6 +6122,8 @@ const TRADUCOES = {
       placeholderDescricaoEntrada: 'Ej: Salario, Extras, Freelance...',
       placeholderDescricaoSaida: 'Ej: Supermercado, Uber, Alquiler...',
       valorReais: 'Monto ($)',
+      valorTotalReais: 'Monto total de la compra ($)',
+      helperValorTotalParcelado: 'Escribe el monto total de la compra. Nosotros lo dividimos en cuotas.',
       placeholderValorTransacao: 'Ej: 150',
       foiParceladoNoCartao: '¿Se pagó en cuotas con la tarjeta?',
       helperParcelasFuturas: 'Las cuotas futuras ya aparecen en el historial, pero solo afectan el saldo cuando llega la fecha de cada una.',
@@ -6020,6 +6261,10 @@ function criarEstilos(cores) {
       padding: 16,
       marginBottom: 16,
       borderWidth: 1,
+    },
+    dailyBudgetCardNeutro: {
+      backgroundColor: cores.fundoCard,
+      borderColor: cores.borda,
     },
     dailyBudgetCardVerde: {
       backgroundColor: cores.verdeFundo,
