@@ -22,6 +22,10 @@ import {
   TextInput,
   Modal,
   Alert,
+  Linking,
+  ActivityIndicator,
+  RefreshControl,
+  Image,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
@@ -4145,6 +4149,210 @@ function traduzirErroAuth(mensagem, t) {
   return chave ? t(chave) : mensagem;
 }
 
+// ---------- Aba "Notícias" ----------
+// Feed de notícias financeiras (mundo + Brasil). Os dados vêm da função
+// serverless /api/noticias (que lê RSS de vários veículos e devolve já
+// resumido). O app só chama o próprio domínio — nenhuma chave envolvida.
+function formatarQuandoNoticia(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const dois = (n) => String(n).padStart(2, '0');
+  const agora = new Date();
+  const mesmoDia = d.toDateString() === agora.toDateString();
+  const hora = `${dois(d.getHours())}:${dois(d.getMinutes())}`;
+  if (mesmoDia) return hora;
+  return `${dois(d.getDate())}/${dois(d.getMonth() + 1)} · ${hora}`;
+}
+
+function TelaNoticias() {
+  const { estilos: styles, cores } = useTema();
+  const { t } = useIdioma();
+
+  const [carregando, setCarregando] = useState(true);
+  const [atualizando, setAtualizando] = useState(false);
+  const [erro, setErro] = useState(false);
+  const [noticias, setNoticias] = useState([]);
+
+  async function buscarNoticias(ehRefresh) {
+    if (ehRefresh) setAtualizando(true);
+    else setCarregando(true);
+    setErro(false);
+    try {
+      const resp = await fetch('/api/noticias', { headers: { Accept: 'application/json' } });
+      if (!resp.ok) throw new Error('status ' + resp.status);
+      const json = await resp.json();
+      const lista = Array.isArray(json.noticias) ? json.noticias : [];
+      setNoticias(lista);
+      if (lista.length === 0) setErro(false);
+    } catch (e) {
+      setErro(true);
+    } finally {
+      setCarregando(false);
+      setAtualizando(false);
+    }
+  }
+
+  useEffect(() => {
+    let vivo = true;
+    (async () => {
+      try {
+        const resp = await fetch('/api/noticias', { headers: { Accept: 'application/json' } });
+        if (!resp.ok) throw new Error('status ' + resp.status);
+        const json = await resp.json();
+        if (!vivo) return;
+        setNoticias(Array.isArray(json.noticias) ? json.noticias : []);
+      } catch (e) {
+        if (vivo) setErro(true);
+      } finally {
+        if (vivo) setCarregando(false);
+      }
+    })();
+    return () => {
+      vivo = false;
+    };
+  }, []);
+
+  async function abrirNoticia(url) {
+    try {
+      await Linking.openURL(url);
+    } catch (e) {
+      avisar(t('comum.ops'), t('noticias.erroAbrir'));
+    }
+  }
+
+  // ---- estados de tela ----
+  if (carregando) {
+    return (
+      <View style={[styles.listContent, { flex: 1, alignItems: 'center', justifyContent: 'center' }]}>
+        <ActivityIndicator size="large" color={cores.primario} />
+        <Text style={[styles.helperText, { marginTop: 16, textAlign: 'center' }]}>
+          {t('noticias.carregando')}
+        </Text>
+      </View>
+    );
+  }
+
+  if (erro) {
+    return (
+      <View style={[styles.listContent, { flex: 1, alignItems: 'center', justifyContent: 'center' }]}>
+        <Ionicons name="cloud-offline-outline" size={40} color={cores.textoMuted} />
+        <Text style={[styles.sectionTitle, { marginTop: 12, textAlign: 'center' }]}>
+          {t('noticias.erroTitulo')}
+        </Text>
+        <Text style={[styles.helperText, { textAlign: 'center' }]}>{t('noticias.erroTexto')}</Text>
+        <TouchableOpacity
+          onPress={() => buscarNoticias(false)}
+          style={{
+            marginTop: 8,
+            backgroundColor: cores.primario,
+            paddingVertical: 12,
+            paddingHorizontal: 24,
+            borderRadius: 12,
+          }}
+        >
+          <Text style={{ color: cores.textoSobrePrimario, fontFamily: FONTES.corpoBold, fontWeight: '700' }}>
+            {t('noticias.tentarNovamente')}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const CabecalhoLista = (
+    <View>
+      <Text style={styles.sectionTitle}>{t('noticias.titulo')}</Text>
+      <Text style={styles.helperText}>{t('noticias.subtitulo')}</Text>
+    </View>
+  );
+
+  if (noticias.length === 0) {
+    return (
+      <View style={styles.listContent}>
+        {CabecalhoLista}
+        <Text style={[styles.helperText, { textAlign: 'center', marginTop: 24 }]}>
+          {t('noticias.vazio')}
+        </Text>
+        <TouchableOpacity
+          onPress={() => buscarNoticias(false)}
+          style={{
+            alignSelf: 'center',
+            marginTop: 8,
+            borderWidth: 1,
+            borderColor: cores.borda,
+            paddingVertical: 10,
+            paddingHorizontal: 20,
+            borderRadius: 12,
+          }}
+        >
+          <Text style={{ color: cores.primario, fontFamily: FONTES.corpoBold, fontWeight: '700' }}>
+            {t('noticias.tentarNovamente')}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const renderNoticia = ({ item }) => (
+    <TouchableOpacity
+      activeOpacity={0.7}
+      onPress={() => abrirNoticia(item.url)}
+      style={{
+        backgroundColor: cores.fundoCard,
+        borderWidth: 1,
+        borderColor: cores.borda,
+        borderRadius: 16,
+        padding: 16,
+        marginBottom: 12,
+      }}
+    >
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <Text style={{ color: cores.primario, fontFamily: FONTES.corpoBold, fontWeight: '700', fontSize: 12 }} numberOfLines={1}>
+          {item.fonte}
+        </Text>
+        {formatarQuandoNoticia(item.dataISO) ? (
+          <Text style={{ color: cores.textoMuted, fontFamily: FONTES.corpo, fontSize: 12, marginLeft: 8 }}>
+            {formatarQuandoNoticia(item.dataISO)}
+          </Text>
+        ) : null}
+      </View>
+      <Text style={{ color: cores.texto, fontFamily: FONTES.corpoBold, fontWeight: '700', fontSize: 15, lineHeight: 21, marginBottom: 6 }}>
+        {item.titulo}
+      </Text>
+      {item.resumo ? (
+        <Text style={{ color: cores.textoSecundario, fontFamily: FONTES.corpo, fontSize: 13, lineHeight: 19 }} numberOfLines={4}>
+          {item.resumo}
+        </Text>
+      ) : null}
+      <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 10 }}>
+        <Text style={{ color: cores.primario, fontFamily: FONTES.corpoSemi, fontWeight: '600', fontSize: 13, marginRight: 4 }}>
+          {t('noticias.lerCompleta')}
+        </Text>
+        <Ionicons name="open-outline" size={15} color={cores.primario} />
+      </View>
+    </TouchableOpacity>
+  );
+
+  return (
+    <FlatList
+      data={noticias}
+      keyExtractor={(item, i) => item.url || String(i)}
+      renderItem={renderNoticia}
+      ListHeaderComponent={CabecalhoLista}
+      contentContainerStyle={styles.listContent}
+      showsVerticalScrollIndicator={false}
+      refreshControl={
+        <RefreshControl
+          refreshing={atualizando}
+          onRefresh={() => buscarNoticias(true)}
+          colors={[cores.primario]}
+          tintColor={cores.primario}
+        />
+      }
+    />
+  );
+}
+
 function TelaLogin() {
   const { estilos: styles, cores, escuro } = useTema();
   const { t } = useIdioma();
@@ -4583,6 +4791,8 @@ function AppConteudo() {
           <TelaInicio />
         ) : abaAtiva === 'investimentos' ? (
           <TelaInvestimentos />
+        ) : abaAtiva === 'noticias' ? (
+          <TelaNoticias />
         ) : (
           <TelaDividas />
         )}
@@ -4632,6 +4842,18 @@ function AppConteudo() {
             {t('abas.dividas')}
           </Text>
           <View style={abaAtiva === 'dividas' ? styles.tabDotAtivo : styles.tabDotEspaco} />
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.tabButton} onPress={() => setAbaAtiva('noticias')}>
+          <Ionicons
+            name={abaAtiva === 'noticias' ? 'newspaper' : 'newspaper-outline'}
+            size={24}
+            color={abaAtiva === 'noticias' ? cores.primario : cores.textoMuted}
+          />
+          <Text style={[styles.tabLabel, abaAtiva === 'noticias' && styles.tabLabelActive]} numberOfLines={1}>
+            {t('abas.noticias')}
+          </Text>
+          <View style={abaAtiva === 'noticias' ? styles.tabDotAtivo : styles.tabDotEspaco} />
         </TouchableOpacity>
       </View>
 
@@ -5138,6 +5360,18 @@ const TRADUCOES = {
       inicio: 'Início',
       investimentos: 'Investimentos',
       dividas: 'Dívidas',
+      noticias: 'Notícias',
+    },
+    noticias: {
+      titulo: 'Notícias financeiras',
+      subtitulo: 'As principais do Brasil e do mundo, atualizadas ao longo do dia. Toque pra ler a matéria completa.',
+      carregando: 'Carregando as notícias…',
+      erroTitulo: 'Não deu pra carregar',
+      erroTexto: 'Verifique sua conexão e tente de novo.',
+      erroAbrir: 'Não consegui abrir o link da notícia.',
+      tentarNovamente: 'Tentar de novo',
+      vazio: 'Nenhuma notícia agora. Puxe pra baixo pra atualizar.',
+      lerCompleta: 'Ler no site',
     },
     config: {
       abrirConfiguracoes: 'Configurações',
@@ -5483,6 +5717,18 @@ const TRADUCOES = {
       inicio: 'Home',
       investimentos: 'Investments',
       dividas: 'Debts',
+      noticias: 'News',
+    },
+    noticias: {
+      titulo: 'Financial news',
+      subtitulo: 'Top headlines from Brazil and the world, updated through the day. Tap to read the full story.',
+      carregando: 'Loading the news…',
+      erroTitulo: "Couldn't load",
+      erroTexto: 'Check your connection and try again.',
+      erroAbrir: "Couldn't open the article link.",
+      tentarNovamente: 'Try again',
+      vazio: 'No news right now. Pull down to refresh.',
+      lerCompleta: 'Read on site',
     },
     config: {
       abrirConfiguracoes: 'Settings',
@@ -5823,6 +6069,18 @@ const TRADUCOES = {
       inicio: 'Inicio',
       investimentos: 'Inversiones',
       dividas: 'Deudas',
+      noticias: 'Noticias',
+    },
+    noticias: {
+      titulo: 'Noticias financieras',
+      subtitulo: 'Las principales de Brasil y del mundo, actualizadas durante el día. Toca para leer la nota completa.',
+      carregando: 'Cargando las noticias…',
+      erroTitulo: 'No se pudo cargar',
+      erroTexto: 'Revisa tu conexión e inténtalo de nuevo.',
+      erroAbrir: 'No se pudo abrir el enlace de la noticia.',
+      tentarNovamente: 'Intentar de nuevo',
+      vazio: 'No hay noticias ahora. Desliza hacia abajo para actualizar.',
+      lerCompleta: 'Leer en el sitio',
     },
     config: {
       abrirConfiguracoes: 'Configuración',
